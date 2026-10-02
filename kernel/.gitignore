@@ -43,3 +43,6 @@ gdb_*.cmd
 *.py
 __pycache__/
 *.cpio
+
+# AArch32 port: pre-sepolicy loader snapshot (build output)
+*.presep21

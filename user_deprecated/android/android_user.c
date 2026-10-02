@@ -17,6 +17,7 @@
 #include <getopt.h>
 
 #include "../supercall.h"
+#include "../ap_compat.h"
 #include "android_user.h"
 
 #define PKG_NAME_LEN 256
@@ -123,7 +124,7 @@ static void load_config_allow_uids()
         profile.to_uid = to_uid;
         if (ssctx) strncpy(profile.scontext, ssctx, sizeof(profile.scontext) - 1);
 
-        sc_su_grant_uid(key, profile.uid, &profile);
+        sc_su_grant_uid(key, &profile);
 
         free(spkg);
         free(suid);

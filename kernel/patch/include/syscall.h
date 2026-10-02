@@ -10,7 +10,44 @@
 #include <ksyms.h>
 #include <hook.h>
 #include <uapi/asm-generic/errno.h>
+
+/*
+ * Syscall-number table selection.
+ *
+ * arm64:  the kernel's native table really is the asm-generic one, so the
+ *         generic header is correct.
+ * armv7:  the kernel's native sys_call_table is the ARM EABI table, and the
+ *         asm-generic numbers are wrong for it.  hook_syscalln(nr, ...) indexes
+ *         the NATIVE table, so using asm-generic numbers here silently installs
+ *         hooks on unrelated slots.  Concretely, with asm-generic:
+ *
+ *             __NR_execve   221 (real:  11)   __NR_openat    56 (real: 322)
+ *             __NR_execveat 281 (real: 387)   __NR_faccessat 48 (real: 334)
+ *
+ *         android_user_init() therefore never hooked the real execve/openat, so
+ *         handle_before_execve()/on_first_app_process() never ran,
+ *         refresh_trusted_manager_state() never ran, trusted_manager_uid stayed
+ *         (uid_t)-1, the APatch manager was never recognised, and the UI showed
+ *         "内核补丁未安装".
+ *
+ * The ARM table lives in linux/arch/arm/include/uapi/asm/unistd.h (added by
+ * this port; content is the same flat EABI table already vendored as
+ * linux/arch/arm64/include/asm/unistd32.h).
+ */
+#if defined(CONFIG_ARM)
+#include <uapi/asm/unistd.h>
+/*
+ * sucompat.c spells the 32-bit fstatat probe the asm-generic way.  Keep that
+ * spelling working on ARM by aliasing it to the real EABI entry (fstatat64=327)
+ * rather than dragging the whole generic table back in (a second #define of the
+ * same __NR_* names with different values would silently win for later code).
+ */
+#ifndef __NR3264_fstatat
+#define __NR3264_fstatat __NR_fstatat64
+#endif
+#else
 #include <uapi/asm-generic/unistd.h>
+#endif
 
 #ifndef __user
 #define __user

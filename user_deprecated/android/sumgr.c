@@ -12,7 +12,7 @@
 
 #include "../supercall.h"
 
-int su_grant(const char *key, uid_t to_uid, const char *scontext)
+int su_grant(const char *key, uid_t uid, uid_t to_uid, const char *scontext)
 {
     struct su_profile profile = { 0 };
     profile.uid = uid;
@@ -21,7 +21,7 @@ int su_grant(const char *key, uid_t to_uid, const char *scontext)
         strncpy(profile.scontext, scontext, sizeof(profile.scontext) - 1);
     }
     profile.scontext[sizeof(profile.scontext) - 1] = '\0';
-    int rc = sc_su_grant_uid(key, uid, &profile);
+    int rc = sc_su_grant_uid(key, &profile);
     return rc;
 }
 

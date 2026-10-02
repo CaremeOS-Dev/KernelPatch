@@ -110,6 +110,31 @@ ARM_FULL_SRCS := \
     $(wildcard patch/module/*.c) \
     $(wildcard patch/ksyms/*.c)
 
+# ---------------------------------------------------------------------
+# ANDROID=1 pulls in the Android userspace-daemon layer (patch/android/*.c),
+# exactly as the upstream aarch64 Makefile does:
+#
+#     ifdef ANDROID
+#         BASE_SRCS += $(wildcard patch/android/*.c)
+#     endif
+#
+# WHY THIS MATTERS ON A32 (root cause of "内核补丁未安装"):
+# without it, `is_trusted_manager_uid()` in patch/common/supercall.c compiles to
+#     #ifdef ANDROID return is_trusted_manager_uid_android(uid); #else return 0;
+# i.e. a constant 0, so supercall before() can NEVER recognise the APatch
+# manager by APK signature.  Combined with boot_patch.sh's rule
+#     [ "$SUPERKEY" != "su" ] && KPT_ARGS="-S $SUPERKEY"
+# (the manager patches with superkey "su", so -S is never passed and there is
+# no preset superkey either) EVERY supercall from the manager uid was silently
+# dropped -> sc_ready() false -> UI "内核补丁未安装" and apd never installed.
+#
+# The `ifdef ANDROID` above (next to ARM_CFLAGS) supplies -DANDROID; this block
+# supplies the translation units.  Both are required.
+# ---------------------------------------------------------------------
+ifdef ANDROID
+    ARM_FULL_SRCS += $(wildcard patch/android/*.c)
+endif
+
 ARM_FULL_OBJS := $(ARM_FULL_SRCS:.c=.arm.o)
 
 .PHONY: full

@@ -15,6 +15,7 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/slab.h>
+#include <linux/sched.h> /* task_struct_offset (comm_offset / seccomp_offset) */
 #include <taskob.h>
 #include <predata.h>
 #include <accctl.h>
@@ -96,6 +97,32 @@ static const struct trusted_manager_entry trusted_managers[] = {
             0x5d, 0x6d, 0x00, 0x2a, 0x7a, 0x12, 0x1a, 0x8f
         }
     },
+    /*
+     * XTC Z9 / MSM8937 ARMv7-A port: the manager we actually ship is
+     * APatch-XTC-Z9-arm32-v2-fixed.apk, built by this tree and therefore signed
+     * with the LOCAL Android debug key, not bmax121's release key.  Its signer
+     * certificate DER SHA-256 is
+     *     503e7746253b98d637bf2bab4d0eadd455d27c7148e74421a100dd87ba640bc7
+     * (verified two ways: raw APK-Signing-Block v2 walk in port/apk_cert_extract.py,
+     * and `openssl x509 -inform DER -fingerprint -sha256` on the extracted DER).
+     *
+     * cert_der_matches_trusted_digest() hashes the certificate DER directly
+     * (userd.c:250-261), which is exactly what that openssl fingerprint is.
+     *
+     * The official digest above is kept so a genuinely release-signed
+     * me.bmax.apatch still works; refresh_trusted_manager_uid_from_packages_list()
+     * takes the LAST successful entry, and both entries carry the same package
+     * name, so the resulting uid is identical either way.
+     */
+    {
+        "me.bmax.apatch",
+        {
+            0x50, 0x3e, 0x77, 0x46, 0x25, 0x3b, 0x98, 0xd6,
+            0x37, 0xbf, 0x2b, 0xab, 0x4d, 0x0e, 0xad, 0xd4,
+            0x55, 0xd2, 0x7c, 0x71, 0x48, 0xe7, 0x44, 0x21,
+            0xa1, 0x00, 0xdd, 0x87, 0xba, 0x64, 0x0b, 0xc7
+        }
+    },
     { "", { 0 } }
 };
 
@@ -110,6 +137,21 @@ static const char ORIGIN_RC_FILES[][64] = {
     ""
 };
 
+/* NOTE (AArch32/XTC port): every SUPERCMD line below authenticates with the
+ * REAL superkey ("%s"), not with the literal token "su".
+ *
+ * handle_supercmd() first tries auth_superkey(argv[1]); the literal "su" only
+ * authenticates when the kernel superkey happens to be exactly "su".  With any
+ * other superkey the code falls into the `else if (!strcmp("su", argv[1]))`
+ * branch, which then requires is_su_allow_uid(0) || is_trusted_manager_uid(0)
+ * -- both false for init (uid 0) -- and returns immediately without redirecting
+ * the exec.  The truncate->apd redirect therefore never happens and apd (which
+ * is what actually mounts modules) is never started.
+ *
+ * With "%s" the key authenticates, is_key_auth is set, and the "exec" command
+ * path rewrites the filename/argv to `/data/adb/apd -s <key> <stage>` exactly
+ * as upstream intends when superkey == "su".  `-Z `MAGISK_SCTX sets the same
+ * scontext the "su" token used to, so behaviour is unchanged in that respect. */
 static const char user_rc_data[] = { //
     "\n"
     "on early-init\n"
@@ -119,17 +161,17 @@ static const char user_rc_data[] = { //
     "on late-init\n"
     "    exec -- " SUPERCMD " %s event late-init before\n"
     "on post-fs-data\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s post-fs-data\n"
+    "    exec -- " SUPERCMD " %s -Z " MAGISK_SCTX " exec " APD_PATH " -s %s post-fs-data\n"
     "on nonencrypted\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s services\n"
+    "    exec -- " SUPERCMD " %s -Z " MAGISK_SCTX " exec " APD_PATH " -s %s services\n"
     "on property:vold.decrypt=trigger_restart_framework\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s services\n"
+    "    exec -- " SUPERCMD " %s -Z " MAGISK_SCTX " exec " APD_PATH " -s %s services\n"
     "on property:sys.boot_completed=1\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " -s %s boot-completed\n"
-    "    exec -- " SUPERCMD " su event boot-completed\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " exec " APD_PATH " uid-listener &\n"
+    "    exec -- " SUPERCMD " %s -Z " MAGISK_SCTX " exec " APD_PATH " -s %s boot-completed\n"
+    "    exec -- " SUPERCMD " %s event boot-completed\n"
+    "    exec -- " SUPERCMD " %s -Z " MAGISK_SCTX " exec " APD_PATH " uid-listener &\n"
     "    rm " REPLACE_RC_FILE "\n"
-    "    exec -- " SUPERCMD " su -Z " MAGISK_SCTX " -c \"mv -f " DEV_LOG_DIR " " AP_LOG_DIR "\"\n"
+    "    exec -- " SUPERCMD " %s -Z " MAGISK_SCTX " -c \"mv -f " DEV_LOG_DIR " " AP_LOG_DIR "\"\n"
     ""
 };
 
@@ -1756,40 +1798,80 @@ static void before_openat(hook_fargs4_t *args, void *udata)
         return;
     }
 
+    /*
+     * ARM32 HARDENING (XTC Z9 / MSM8937 port).
+     *
+     * This hook sits in front of EVERY openat() on the device, so it must never
+     * be able to turn a working openat() into a failing one.  Three distinct
+     * ways it used to corrupt the syscall are closed here; they are what turned
+     * the v7 boot into a system-wide EFAULT/EINVAL storm right after
+     * sucompat_init() ran:
+     *
+     *  1. `args->arg1 = (uint64_t)up;` was executed even when
+     *     copy_to_user_stack() had failed and returned NULL.  The syscall then
+     *     ran as sys_openat(..., filename = NULL, ...) -> -EFAULT.  A bogus
+     *     filename is now never published: if neither user-memory helper works
+     *     we leave args->arg1 untouched and the real openat proceeds.
+     *
+     *  2. `char added_rc_data[4096]` was a 4 KiB frame on top of the execve /
+     *     filp_open / kernel_write chains.  AArch32 tasks get 8 KiB stacks with
+     *     no separate IRQ stack, so this was the deepest frame in the whole
+     *     blob (4404 B).  It is now static storage, which also removes the
+     *     `replaced`-guarded re-entrancy hazard.
+     *
+     *  3. `if (!ori_rc_data) goto out;` jumped over filp_close(), leaking
+     *     REPLACE_RC_FILE on every failure.  Both error paths now share `free`.
+     *
+     * The task-offset gate is a second belt-and-braces check: if
+     * resolve_struct() did not populate the task layout, the Cred/seccomp work
+     * this feature depends on is unsafe, and rc injection is not worth a
+     * non-booting device.
+     */
+    if (task_struct_offset.comm_offset <= 0) {
+        log_boot("before_openat: task offsets unresolved, skip rc injection\n");
+        return;
+    }
+
     replaced = 1;
     const char *origin_rc = ORIGIN_RC_FILES[args->local.data3 - 1];
 
     loff_t ori_len = 0;
+    loff_t off = 0;
+    const char *ori_rc_data = 0;
+    int cplen = 0;
+
     struct file *newfp = filp_open(REPLACE_RC_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (!newfp || IS_ERR(newfp)) {
         log_boot("create replace rc error: %d\n", PTR_ERR(newfp));
-        goto out;
+        return;
     }
 
-    loff_t off = 0;
-    const char *ori_rc_data = kernel_read_file(origin_rc, &ori_len);
-    if (!ori_rc_data) goto out;
+    ori_rc_data = kernel_read_file(origin_rc, &ori_len);
+    if (!ori_rc_data) goto free;
     kernel_write(newfp, ori_rc_data, ori_len, &off);
     if (off != ori_len) {
         log_boot("write replace rc error: %x\n", off);
         goto free;
     }
 
-    char added_rc_data[4096];
-    const char *sk = get_superkey();
-    int added_rc_len = expand_rc_template(added_rc_data, sizeof(added_rc_data), user_rc_data, sk);
-    if (added_rc_len < 0) {
-        log_boot("expand rc template error: %d\n", added_rc_len);
-        goto free;
+    {
+        /* Static scratch - see note 2 above.  `replaced` makes this a
+         * once-per-boot operation, so a single shared buffer is sufficient. */
+        static char added_rc_data[4096];
+        const char *sk = get_superkey();
+        int added_rc_len = expand_rc_template(added_rc_data, sizeof(added_rc_data), user_rc_data, sk);
+        if (added_rc_len < 0) {
+            log_boot("expand rc template error: %d\n", added_rc_len);
+            goto free;
+        }
+
+        kernel_write(newfp, added_rc_data, added_rc_len, &off);
+        if (off != added_rc_len + ori_len) {
+            log_boot("write replace rc error: %x\n", off);
+            goto free;
+        }
     }
 
-    kernel_write(newfp, added_rc_data, added_rc_len, &off);
-    if (off != added_rc_len + ori_len) {
-        log_boot("write replace rc error: %x\n", off);
-        goto free;
-    }
-
-    int cplen = 0;
     cplen = compat_copy_to_user((void *)filename, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
     if (cplen > 0) {
         args->local.data0 = cplen;
@@ -1797,13 +1879,17 @@ static void before_openat(hook_fargs4_t *args, void *udata)
         log_boot("redirect rc file: %x\n", args->local.data0);
     } else {
         void *__user up = copy_to_user_stack(REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
-        args->arg1 = (uint64_t)up;
-        log_boot("redirect rc file stack: %llx\n", up);
+        if (up && !IS_ERR(up)) {
+            args->arg1 = (uint64_t)up;
+            log_boot("redirect rc file stack: %llx\n", up);
+        } else {
+            log_boot("redirect rc file: no user memory helper, leaving openat intact\n");
+        }
     }
 
 free:
     filp_close(newfp, 0);
-    kvfree(ori_rc_data);
+    if (ori_rc_data) kvfree(ori_rc_data);
 
 out:
     args->local.data2 = 1;

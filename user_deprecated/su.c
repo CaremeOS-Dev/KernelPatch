@@ -23,6 +23,7 @@
 #include <error.h>
 
 #include "supercall.h"
+#include "ap_compat.h"
 
 enum
 {

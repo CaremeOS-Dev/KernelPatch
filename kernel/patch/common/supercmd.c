@@ -29,6 +29,82 @@
 #define SUPERCMD_ARGV_STEP 8
 #endif
 
+/*
+ * Scratch size used by handle_supercmd()/supercmd_echo().
+ *
+ * Two hard constraints, both measured on the device:
+ *
+ *  1. ARM32 tasks get 8 KiB kernel stacks (THREAD_SIZE 8192, see current.h).
+ *     These two buffers sit on ONE chain - before_execve ->
+ *     handle_before_execve -> handle_supercmd -> supercmd_echo - so together
+ *     they must stay far below 8 KiB once hook and syscall frames are counted.
+ *     At 4 KiB each (upstream) they added up to 8 KiB of arrays and smashed the
+ *     stack: the first injected rc bootstrap line (`event early-init before`,
+ *     which always reaches supercmd_echo for its "report success" message) took
+ *     the device down with a paging-fault storm and a corrupted console prefix
+ *     (`c-392321000 ... []`).  v3 never reached supercmd_echo() - its argv
+ *     helper bailed out early - so only one 4 KiB frame existed, the kernel
+ *     booted, and apd never ran.
+ *
+ *  2. kmalloc() must NOT be used here.  This kernel's KP blob does not resolve
+ *     the kmalloc kfunc, so `kmalloc(4096, KP_GFP_KERNEL)` compiled to a call
+ *     through a NULL pointer (r0=0x1000 r1=0xcc0 r3=0x0, PC=0x0) and panicked
+ *     right after commit_common_su.  strndup_user()/memdup_user()/kfree() are
+ *     resolved on this build; kmalloc is not.
+ *
+ * 1 KiB per buffer keeps the whole chain near 3 KiB.  The only cost is that
+ * verbose help / module-listing output is truncated, and vsnprintf always
+ * terminates that safely.
+ */
+#define SUPERCMD_BUF_SIZE 1024
+
+/*
+ * AArch32 argv[] access, kept LOCAL to supercmd.
+ *
+ * patch/common/syscall.c's get_user_arg_ptr()/set_user_arg_ptr() implement the
+ * arm64 contract (a0 = is_compat flag, a1 = the array, 8-byte slots).  That
+ * helper is also reached from the early-boot execve hook in
+ * patch/android/userd.c (handle_before_execve scans argv to spot
+ * "second_stage" and scans envp for INIT_SECOND_STAGE), i.e. it runs on the
+ * very first /system/bin/init exec.  Rewriting it globally to the 32-bit
+ * contract therefore changed behaviour on every early execve, and a kernel
+ * that booted stopped booting.
+ *
+ * supercmd is reached strictly later - the injected rc bootstrap line - and a
+ * pure AArch32 kernel has no compat layer: argv/envp are plain arrays of
+ * 4-byte pointers.  Slots are read/written here, locally, leaving syscall.c's
+ * shared helpers byte-identical to the known-booting build.
+ */
+#if defined(CONFIG_ARM)
+static const char __user *supercmd_argv(const void __user *uargv, int nr)
+{
+    const void __user *slot_p = (const void __user *)((unsigned long)uargv + nr * SUPERCMD_ARGV_STEP);
+    const char __user **slot = memdup_user(slot_p, SUPERCMD_ARGV_STEP);
+    if (IS_ERR(slot)) return ERR_PTR((long)slot);
+    const char __user *arg = *slot;
+    kfree(slot);
+    return arg;
+}
+
+static int supercmd_set_argv(const void __user *uargv, int nr, uintptr_t val)
+{
+    void __user *slot_p = (void __user *)((unsigned long)uargv + nr * SUPERCMD_ARGV_STEP);
+    uintptr_t v = val;
+    int cplen = compat_copy_to_user(slot_p, (void *)&v, SUPERCMD_ARGV_STEP);
+    return cplen == SUPERCMD_ARGV_STEP ? 0 : cplen;
+}
+#else
+static inline const char __user *supercmd_argv(const void __user *uargv, int nr)
+{
+    return get_user_arg_ptr(0, (void *)uargv, nr);
+}
+
+static inline int supercmd_set_argv(const void __user *uargv, int nr, uintptr_t val)
+{
+    return set_user_arg_ptr(0, (void *)uargv, nr, val);
+}
+#endif
+
 static char *__user supercmd_str_to_user_sp(const char *data, uintptr_t *sp)
 {
     int len = strlen(data) + 1;
@@ -52,7 +128,8 @@ static void supercmd_echo(char **__user u_filename_p, char **__user uargv, uintp
 {
     supercmd_exec(u_filename_p, ECHO_PATH, sp);
 
-    char buffer[4096];
+    /* Small stack buffer: a sibling frame lives in handle_supercmd(). */
+    char buffer[SUPERCMD_BUF_SIZE];
     va_list va;
     va_start(va, fmt);
     vsnprintf(buffer, sizeof(buffer), fmt, va);
@@ -61,9 +138,9 @@ static void supercmd_echo(char **__user u_filename_p, char **__user uargv, uintp
     const char *__user cmd = supercmd_str_to_user_sp(ECHO_PATH, sp);
     const char *__user argv1 = supercmd_str_to_user_sp(buffer, sp);
 
-    set_user_arg_ptr(0, *uargv, 0, (uintptr_t)cmd);
-    set_user_arg_ptr(0, *uargv, 1, (uintptr_t)argv1);
-    set_user_arg_ptr(0, *uargv, 2, 0);
+    supercmd_set_argv(*uargv, 0, (uintptr_t)cmd);
+    supercmd_set_argv(*uargv, 1, (uintptr_t)argv1);
+    supercmd_set_argv(*uargv, 2, 0);
 }
 
 static const char supercmd_help[] =
@@ -343,7 +420,7 @@ void handle_supercmd(char **__user u_filename_p, char **__user uargv)
         is_key_auth = 1;
     }
     // key
-    const char __user *p1 = get_user_arg_ptr(0, *uargv, 1);
+    const char __user *p1 = supercmd_argv(*uargv, 1);
     if (!p1 || IS_ERR(p1)) return;
 
     struct su_profile profile = { .to_uid = 0, .scontext = "" };
@@ -368,7 +445,7 @@ void handle_supercmd(char **__user u_filename_p, char **__user uargv)
     const char *parr[SUPERCMD_ARGS_NO + 4] = { 0 };
 
     for (int i = 2; i < SUPERCMD_ARGS_NO; i++) {
-        const char __user *ua = get_user_arg_ptr(0, *uargv, i);
+        const char __user *ua = supercmd_argv(*uargv, i);
         if (IS_ERR(ua)) break;
         const char *a = strndup_user(ua, 512);
         if (IS_ERR(a)) break;
@@ -389,7 +466,7 @@ void handle_supercmd(char **__user u_filename_p, char **__user uargv)
     if (!parr[2]) {
         supercmd_exec(u_filename_p, sh_path, &sp);
         const char *__user argv1 = supercmd_str_to_user_sp(sh_path, &sp);
-        set_user_arg_ptr(0, *uargv, 1, (uintptr_t)argv1);
+        supercmd_set_argv(*uargv, 1, (uintptr_t)argv1);
         *uargv += 1 * SUPERCMD_ARGV_STEP;
         commit_su(profile.to_uid, profile.scontext);
         return;
@@ -434,7 +511,9 @@ void handle_supercmd(char **__user u_filename_p, char **__user uargv)
 
     struct cmd_res cmd_res = { 0 };
 
-    char buffer[4096];
+    /* Stack, not heap - see SUPERCMD_BUF_SIZE (this build's kmalloc kfunc is
+     * unresolved, so kmalloc() here would call through a NULL pointer). */
+    char buffer[SUPERCMD_BUF_SIZE];
     buffer[0] = '\0';
 
     // command
@@ -483,7 +562,7 @@ void handle_supercmd(char **__user u_filename_p, char **__user uargv)
         goto echo;
     #endif
     } else if (!strcmp("sumgr", cmd)) {
-        handle_cmd_sumgr(u_filename_p, carr, buffer, sizeof(buffer), &cmd_res);
+        handle_cmd_sumgr(u_filename_p, carr, buffer, SUPERCMD_BUF_SIZE, &cmd_res);
     } else if (!strcmp("event", cmd)) {
         if (carr[1]) {
             cmd_res.rc = report_user_event(carr[1], carr[2]);
@@ -499,7 +578,7 @@ void handle_supercmd(char **__user u_filename_p, char **__user uargv)
         cmd_res.msg = "test done...";
     } else {
         if (is_key_auth) {
-            handle_cmd_key_auth(u_filename_p, cmd, carr, buffer, sizeof(buffer), &cmd_res);
+            handle_cmd_key_auth(u_filename_p, cmd, carr, buffer, SUPERCMD_BUF_SIZE, &cmd_res);
         } else {
             cmd_res.err_msg = "invalid command or a superkey is required";
         }

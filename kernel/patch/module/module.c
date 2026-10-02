@@ -34,7 +34,21 @@
 
 #define align(X) ALIGN(X, page_size)
 
+/*
+ * XTC Z9 / MSM8937 AArch32 port: a KPM must be built for the kernel that loads
+ * it.  Upstream only ever loaded AArch64 modules, so this was hardcoded to
+ * EM_AARCH64; on the ARM32 build that rejects every valid ARM module and (worse)
+ * lets the loader read an ELF32 image through Elf64_* structures.  The elf.h in
+ * kernel/linux/arch/arm already defines elf_check_arch() as EM_ARM, so prefer it
+ * and keep the literal only as a fallback.
+ */
+#ifndef elf_check_arch
+#if defined(CONFIG_ARM)
+#define elf_check_arch(x) ((x)->e_machine == EM_ARM)
+#else
 #define elf_check_arch(x) ((x)->e_machine == EM_AARCH64)
+#endif
+#endif
 
 #define ARCH_SHF_SMALL 0
 
@@ -78,6 +92,50 @@ static void set_kpm_load_result(void __user *reserved, long code, const char *me
 static inline bool strstarts(const char *str, const char *prefix)
 {
     return strncmp(str, prefix, strlen(prefix)) == 0;
+}
+
+/*
+ * Resolve a bare kernel-symbol name against KernelPatch's `kf_` trampolines.
+ *
+ * WHY THIS IS NEEDED (measured on the XTC Z9 / AArch32 port)
+ * ----------------------------------------------------------
+ * KernelPatch exposes kernel functions to modules through the `kfunc()` macro
+ * (patch/include/ksyms.h:23):
+ *
+ *      #define kfunc(func)     kf_##func
+ *      #define kfunc_def(func) (*kf_##func)
+ *
+ * and registers them in the symbol table under that PREFIXED name, e.g.
+ * `KP_EXPORT_SYMBOL(kfunc(memcpy))` publishes "kf_memcpy" (whose table entry is
+ * the ADDRESS OF THE POINTER VARIABLE, because `kf_memcpy` is a function
+ * pointer, not a function).
+ *
+ * A module that writes `memcpy(...)` and gets rewritten by the macro therefore
+ * references `kf_memcpy` and resolves fine.  But GCC ALSO emits IMPLICIT
+ * memcpy/memset calls for struct assignment, aggregate initialisation and
+ * zeroing, and those do not go through any macro -- the symbol arrives here as
+ * the bare name `memcpy`.  That lookup used to fail, and the module was
+ * rejected:
+ *
+ *      [-] KP E unknown symbol: memcpy
+ *      [-] KP E unknown symbol: memset
+ *      KP load AP KPM: .../kpm-hello-demo.kpm, event: post-fs-data, rc: -2
+ *
+ * So: on a direct miss, retry with the `kf_` prefix and DEREFERENCE the result,
+ * because the table stores &kf_x (a pointer variable) while the call site needs
+ * the kernel function x itself.
+ */
+static unsigned long symbol_lookup_kfunc_alias(const char *name)
+{
+    char alias[KP_SYMBOL_LEN + 8];
+    int n = snprintf(alias, sizeof(alias), "kf_%s", name);
+    if (n <= 0 || n >= (int)sizeof(alias)) return 0;
+
+    unsigned long slot = symbol_lookup_name(alias);
+    if (!slot) return 0;
+
+    /* slot == &kf_<name>; dereference once to get the real function address. */
+    return *(unsigned long *)slot;
 }
 
 static char *next_string(char *string, unsigned long *secsize)
@@ -220,6 +278,13 @@ static int simplify_symbols(struct module *mod, struct load_info *info)
             break;
         case SHN_UNDEF:
             unsigned long addr = symbol_lookup_name(name);
+            /*
+             * GCC-emitted implicit memcpy/memset (and any other bare kernel
+             * function name) arrive without the `kf_` prefix that
+             * KP_EXPORT_SYMBOL registered.  Fall back to the prefixed
+             * trampoline before declaring the symbol missing.
+             */
+            if (!addr) addr = symbol_lookup_kfunc_alias(name);
             // kernel symbol cause overflow in relocation
             // if (!addr) addr = kallsyms_lookup_name(name);
             if (!addr) {
@@ -310,7 +375,10 @@ static int rewrite_section_headers(struct load_info *info)
 static int move_module(struct module *mod, struct load_info *info)
 {
     // todo:
-    logki("alloc module size: %llx\n", mod->size);
+    /* `%llx` consumes 8 bytes of varargs; mod->size is 32-bit on AArch32, so
+     * passing it directly printed (next_reg << 32) | size -- the
+     * "alloc module size: c02481f8000034b1" seen in the device log. */
+    logki("alloc module size: %llx\n", (unsigned long long)mod->size);
     mod->start = kp_malloc_exec(mod->size);
     if (!mod->start) {
         return -ENOMEM;
@@ -328,7 +396,13 @@ static int move_module(struct module *mod, struct load_info *info)
         dest = mod->start + shdr->sh_entsize;
         const char *sname = info->secstrings + shdr->sh_name;
 
-        logkd("    %s %llx %llx\n", sname, dest, shdr->sh_size);
+        /* All three conversions are %llx: every argument must be widened to
+         * 64 bits explicitly.  On AArch32 dest/sh_size are 32-bit, so passing
+         * them bare made vsnprintf read register pairs -- "    .kpm.ctl0
+         * 4d6753004 3000000002" in the device log instead of
+         * "    0xd6753004 0x4". */
+        logkd("    %s %llx %llx\n", sname, (unsigned long long)(uintptr_t)dest,
+              (unsigned long long)shdr->sh_size);
 
         if (shdr->sh_type != SHT_NOBITS) memcpy(dest, (void *)shdr->sh_addr, shdr->sh_size);
 
@@ -436,7 +510,11 @@ static int elf_header_check(struct load_info *info)
     }
     if (memcmp(info->hdr->e_ident, ELFMAG, SELFMAG) || info->hdr->e_type != ET_REL || !elf_check_arch(info->hdr) ||
         info->hdr->e_shentsize != sizeof(Elf_Shdr)) {
+#if defined(CONFIG_ARM)
+        set_load_error(info, "ELF header is not a supported ARM32 (AArch32) relocatable module");
+#else
         set_load_error(info, "ELF header is not a supported AArch64 relocatable module");
+#endif
         return -ENOEXEC;
     }
     if (info->hdr->e_shoff >= info->len || (info->hdr->e_shnum * sizeof(Elf_Shdr) > info->len - info->hdr->e_shoff)) {
@@ -576,7 +654,8 @@ long load_module_path_event(const char *path, const char *args, const char *even
         goto out;
     }
     loff_t len = vfs_llseek(filp, 0, SEEK_END);
-    logkfd("module size: %llx\n", len);
+    /* loff_t is 32-bit on AArch32; widen for %llx. */
+    logkfd("module size: %llx\n", (unsigned long long)len);
     vfs_llseek(filp, 0, SEEK_SET);
 
     void *data = vmalloc(len);
@@ -656,7 +735,9 @@ out:
 
 long module_control1(const char *name, void *a1, void *a2, void *a3)
 {
-    logkfi("name %s, a1: %llx, a2: %llx, a3: %llx\n", name, a1, a2, a3);
+    /* Pointers are 32-bit on AArch32; widen every %llx argument. */
+    logkfi("name %s, a1: %llx, a2: %llx, a3: %llx\n", name, (unsigned long long)(uintptr_t)a1,
+           (unsigned long long)(uintptr_t)a2, (unsigned long long)(uintptr_t)a3);
     long rc = 0;
     rcu_read_lock();
 

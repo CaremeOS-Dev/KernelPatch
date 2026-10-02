@@ -55,6 +55,10 @@ static const char *current_su_path = 0;
 
 static int su_kstorage_gid = -1;
 static int exclude_kstorage_gid = -1;
+/* 1 while su_register_path_probe_hooks() has the fstatat/faccessat probes
+ * installed.  Stays 0 under the AArch32 safety gate so the unregister path
+ * never unwraps a hook that was never installed. */
+static int su_path_probe_hooks_active = 0;
 static void su_register_path_probe_hooks(void);
 static void su_unregister_path_probe_hooks(void);
 long kp_control_feature_sc(const char __user *uname, int state)
@@ -281,7 +285,19 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
             filp_close(filp, 0);
 
             // command
+#if defined(CONFIG_ARM)
+            /* AArch32 (ILP32): uintptr_t is 4 bytes.  `uint64_t sp` passed to
+             * compat_copy_to_user()'s 32-bit (void __user *) parameter made
+             * AAPCS pass the HIGH half of the 64-bit value (r4) instead of the
+             * address -- the call then failed with -EFAULT and the whole
+             * /system/bin/su -> apd redirect silently broke.  The v8 boot log
+             * shows it verbatim:
+             *     handle_before_execve: call apd uid: 0, ..., cplen: -14, 0
+             * (identical pattern to the supercmd.c:460 fix). */
+            uintptr_t sp = 0;
+#else
             uint64_t sp = 0;
+#endif
             sp = current_user_stack_pointer();
             sp -= sizeof(apd_path);
             sp &= 0xFFFFFFFFFFFFFFF8;
@@ -564,6 +580,53 @@ static void su_register_path_probe_hooks(void)
     #ifdef ANDROID
         if (unlikely(android_is_safe_mode)) return;
     #endif
+
+    /*
+     * DISABLED BY DEFAULT on AArch32 (XTC Z9 / MSM8937, kernel 4.9.193).
+     *
+     * These four hooks are the exact delta between the v3 build, which booted
+     * and stayed healthy, and the v7 build, which survives 11.5 s and then
+     * takes a system-wide EFAULT/EINVAL storm:
+     *
+     *   - v3 never reached this function at all.  sucompat_init() is called
+     *     from report_user_event("post-fs-data","before"), which only runs once
+     *     apd is up; in v3 the superkey never authenticated (userd.c injected
+     *     the literal token "su"), so apd never started and no probe was ever
+     *     installed.  With the "%s" superkey fixed, apd runs - and the probes
+     *     run for the first time.
+     *
+     *   - On the device the probes are installed at t=11.558
+     *     (`KP hook __NR3264_fstatat rc: 0` / `__NR_faccessat rc: 0`), and the
+     *     first `Bad address` appears 14.7 ms later at t=11.573
+     *     (ueventd reading sysfs).  From that point nothing recovers: 60
+     *     EFAULT lines, no successful open/stat/exec anywhere afterwards,
+     *     while fork() keeps working.
+     *
+     *   - Everything else in the same window is already proven harmless: the
+     *     inline getname_flags hook, the execve/execveat hooks and the openat
+     *     hook have all been live since t=1.04 and the system ran clean for the
+     *     following 10.5 s.
+     *
+     * hook_syscalln()/hook_compat_syscalln() on this kernel both end up
+     * touching sys_call_table[327]/[334] (compat_sys_call_table is NULL, so the
+     * "32-bit" variants fall back to inline_wrap_syscalln() and resolve the
+     * same sys_fstatat64/sys_faccessat bodies - i.e. the same function is
+     * hooked twice), so this is one change, not four independent risks.
+     *
+     * The probes only ever rewrote a path when it was literally
+     * /system/bin/kp or /system/bin/su, so disabling them costs nothing on a
+     * device whose su path is not installed yet.
+     *
+     * To re-enable, delete the `return` below.  kp_control_feature_sc()'s
+     * "path_probe" switch also calls this function, so removing the early
+     * return restores both the boot-time and the runtime enable in one edit.
+     *
+     * Re-enable only after the EFAULT mechanism above is understood; keeping a
+     * booting device is worth more than an su-probe nicety.
+     */
+    log_boot("sucompat: path probe hooks DISABLED (AArch32 safety, see sucompat.c)\n");
+    return;
+
     hook_err_t rc;
 
     rc = hook_syscalln(__NR3264_fstatat, 4, su_handler_arg1_ufilename_before, 0, (void *)0);
@@ -578,10 +641,19 @@ static void su_register_path_probe_hooks(void)
 
     rc = hook_compat_syscalln(334, 3, su_handler_arg1_ufilename_before, 0, (void *)0);
     log_boot("hook 32 __NR_faccessat rc: %d\n", rc);
+
+    su_path_probe_hooks_active = 1;
 }
 
 static void su_unregister_path_probe_hooks(void)
 {
+    /* Nothing was registered by su_register_path_probe_hooks() while the
+     * AArch32 safety gate is active, so do not touch the syscall table here:
+     * hook_unwrap() on a never-hooked function is a needless risk on the
+     * openat/stat fast path. */
+    if (!su_path_probe_hooks_active) return;
+
+    su_path_probe_hooks_active = 0;
     unhook_syscalln(__NR3264_fstatat, su_handler_arg1_ufilename_before, 0);
     unhook_syscalln(__NR_faccessat, su_handler_arg1_ufilename_before, 0);
     unhook_compat_syscalln(327, su_handler_arg1_ufilename_before, 0);

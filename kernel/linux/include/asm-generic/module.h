@@ -14,7 +14,31 @@ struct mod_arch_specific
 };
 #endif
 
+/*
+ * XTC Z9 / MSM8937 AArch32 port: the ELF width of a KPM must match the width of
+ * the kernel that loads it.  Upstream hardcodes `#define CONFIG_64BIT` here
+ * because the only KPM consumer used to be arm64, which forced Elf64_Shdr /
+ * Elf64_Sym / Elf64_Rela even in the CONFIG_ARM build.  An ARM32 KPM produced by
+ * arm-linux-gnueabi is ELF32 (Class: ELF32, SHT_REL), and the loader reading it
+ * through Elf64_* structs misreads every section header, symbol and relocation
+ * record, so the module never loads.
+ *
+ * ARM32 KPMs are REL (SHT_REL / Elf32_Rel) and carry no addend in the record;
+ * AArch64 KPMs are RELA (SHT_RELA / Elf64_Rela).
+ */
+#if !defined(CONFIG_ARM)
 #define CONFIG_64BIT
+#endif
+
+/*
+ * ARM32 KPM images are ET_REL linked with the default ARM EABI relocation
+ * model, i.e. SHT_REL (Elf32_Rel, no in-record addend).  This must be decided
+ * BEFORE the width block below, because that block selects Elf_Rel/Elf_Rela
+ * from it.  AArch64 KPMs are SHT_RELA (Elf64_Rela).
+ */
+#if defined(CONFIG_ARM) && !defined(CONFIG_MODULES_USE_ELF_REL) && !defined(CONFIG_MODULES_USE_ELF_RELA)
+#define CONFIG_MODULES_USE_ELF_REL
+#endif
 
 #ifdef CONFIG_64BIT
 #define Elf_Shdr Elf64_Shdr

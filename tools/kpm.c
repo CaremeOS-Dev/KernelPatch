@@ -9,7 +9,15 @@
 
 #include "kpm.h"
 
+/*
+ * Arch gate for a KPM image: must match the kernel this KPM will be loaded into,
+ * which is the architecture kptools itself was built for.  See kpm.h.
+ */
+#if KP_KPM_ELF32
+#define elf_check_arch(x) ((x)->e_machine == EM_ARM)
+#else
 #define elf_check_arch(x) ((x)->e_machine == EM_AARCH64)
+#endif
 
 static char *next_string(char *string, uint64_t *secsize)
 {

@@ -94,7 +94,12 @@ int commit_common_su(uid_t to_uid, const char *sctx)
     struct thread_info *thi = current_thread_info();
     thi->flags &= ~(_TIF_SECCOMP);
 
-    if (task_struct_offset.comm_offset > 0) {
+    /* Gate the seccomp write on seccomp_offset itself, not on comm_offset.
+     * resolve_struct() only fills seccomp_offset when the seccomp probe
+     * succeeds; comm_offset can be valid while seccomp_offset is still -1, and
+     * the original `comm_offset > 0` test then wrote SECCOMP_MODE_DISABLED four
+     * bytes before the task_struct. */
+    if (task_struct_offset.seccomp_offset > 0) {
         struct seccomp *seccomp = (struct seccomp *)((uintptr_t)task + task_struct_offset.seccomp_offset);
         seccomp->mode = SECCOMP_MODE_DISABLED;
         // only be called when the task is exiting, so no barriers
@@ -150,7 +155,7 @@ int task_su(pid_t pid, uid_t to_uid, const char *sctx)
     struct thread_info *thi = get_task_thread_info(task);
     thi->flags &= ~(_TIF_SECCOMP);
 
-    if (task_struct_offset.comm_offset > 0) {
+    if (task_struct_offset.seccomp_offset > 0) {
         struct seccomp *seccomp = (struct seccomp *)((uintptr_t)task + task_struct_offset.seccomp_offset);
         seccomp->mode = SECCOMP_MODE_DISABLED;
         // only be called when the task is exiting, so no barriers
