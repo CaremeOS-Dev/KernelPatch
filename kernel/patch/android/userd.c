@@ -1765,9 +1765,9 @@ static void after_execveat(hook_fargs5_t *args, void *udata)
 static void before_openat(hook_fargs4_t *args, void *udata)
 {
     
-    // cp len
+    // redirected flag
     args->local.data0 = 0;
-    // cp ptr
+    // original filename argument
     args->local.data1 = 0;
     // unhook flag
     args->local.data2 = 0;
@@ -1781,7 +1781,7 @@ static void before_openat(hook_fargs4_t *args, void *udata)
     const char __user *filename = (typeof(filename))syscall_argn(args, 1);
     char buf[256];
     long rc = compat_strncpy_from_user(buf, filename, sizeof(buf));
-    if (rc <= 0) return;
+    if (rc <= 0 || rc >= sizeof(buf)) return;
 
     int file_count = sizeof(ORIGIN_RC_FILES) / sizeof(ORIGIN_RC_FILES[0]);
     for (int i = 0; i < file_count; i++) {
@@ -1872,20 +1872,20 @@ static void before_openat(hook_fargs4_t *args, void *udata)
         }
     }
 
-    cplen = compat_copy_to_user((void *)filename, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
-    if (cplen > 0) {
-        args->local.data0 = cplen;
-        args->local.data1 = (uint64_t)args->arg1;
-        log_boot("redirect rc file: %x\n", args->local.data0);
-    } else {
-        void *__user up = copy_to_user_stack(REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
-        if (up && !IS_ERR(up)) {
-            args->arg1 = (uint64_t)up;
-            log_boot("redirect rc file stack: %llx\n", up);
-        } else {
-            log_boot("redirect rc file: no user memory helper, leaving openat intact\n");
-        }
+    /* Never overwrite init's filename allocation: /init.rc is shorter than
+     * REPLACE_RC_FILE, and the 64-byte table entries are not buffer sizes. */
+    uintptr_t sp = current_user_stack_pointer();
+    if (sp < sizeof(REPLACE_RC_FILE)) goto free;
+    sp = (sp - sizeof(REPLACE_RC_FILE)) & ~(uintptr_t)15;
+    cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
+    if (cplen != sizeof(REPLACE_RC_FILE)) {
+        log_boot("redirect rc file copy error: %d\n", cplen);
+        goto free;
     }
+    args->local.data0 = 1;
+    args->local.data1 = syscall_argn(args, 1);
+    set_syscall_argn(args, 1, sp);
+    log_boot("redirect rc file stack: %llx\n", sp);
 
 free:
     filp_close(newfp, 0);
@@ -1898,14 +1898,9 @@ out:
 
 static void after_openat(hook_fargs4_t *args, void *udata)
 {
-    if (args->local.data0 && args->local.data3 > 0) {
-        
-        const char *origin_rc = ORIGIN_RC_FILES[args->local.data3 - 1];
-        compat_copy_to_user(
-            (void *)args->local.data1,
-            origin_rc,
-            sizeof(ORIGIN_RC_FILES[args->local.data3 - 1]));
-        log_boot("restore rc file: %x\n", args->local.data0);
+    if (args->local.data0) {
+        set_syscall_argn(args, 1, args->local.data1);
+        log_boot("redirect rc file open result: %ld\n", (long)args->ret);
     }
     if (args->local.data2) {
         unhook_syscalln(__NR_openat, before_openat, after_openat);

@@ -51,7 +51,11 @@ int bypass_selinux();
 int resolve_pt_regs();
 int supercall_install();
 void module_init();
+/* Capture SELinux policy loads from the boot path: the platform policy is
+ * loaded by init long before post-fs-data, so the hook must be in place now. */
+int selinux_sepolicy_boot_init();
 void syscall_init();
+void syscall_dispatch_init();
 int kstorage_init();
 int su_compat_init();
 // int selinux_hide_init();
@@ -73,6 +77,10 @@ static void before_rest_init(hook_fargs4_t *args, void *udata)
     if ((rc = bypass_kcfi())) goto out;
     log_boot("bypass_kcfi done: %d\n", rc);
 
+    /* Must precede supercall_install/su_compat_init so their hook_syscalln
+     * calls register with the dispatcher instead of patching the table. */
+    syscall_dispatch_init();
+
     if ((rc = resolve_struct())) goto out;
     log_boot("resolve_struct done: %d\n", rc);
 
@@ -91,8 +99,7 @@ static void before_rest_init(hook_fargs4_t *args, void *udata)
     rc = su_compat_init();
     log_boot("su_compat_init done: %d\n", rc);
 
-    // rc = selinux_hide_init();
-    // log_boot("selinux_hide_init done: %d\n", rc);
+    log_boot("selinux_sepolicy_boot_init: %d\n", selinux_sepolicy_boot_init());
 
     rc = resolve_pt_regs();
     log_boot("resolve_pt_regs done: %d\n", rc);

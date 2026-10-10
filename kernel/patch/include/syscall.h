@@ -45,6 +45,18 @@
 #ifndef __NR3264_fstatat
 #define __NR3264_fstatat __NR_fstatat64
 #endif
+/*
+ * arm64 defines compat_user_mode() in its own asm/ptrace.h.  An AArch32 kernel
+ * has no compat layer (every user task is native 32-bit), so the shared syscall
+ * dispatcher code gets a constant-false definition here.  The dispatcher itself
+ * only ever activates when el0_svc_common/invoke_syscall resolve -- neither
+ * exists on ARMv7 -- so on ARM32 it always falls back to the per-syscall hooks.
+ */
+static inline int compat_user_mode(const struct pt_regs *regs)
+{
+    (void)regs;
+    return 0;
+}
 #else
 #include <uapi/asm-generic/unistd.h>
 #endif
@@ -206,5 +218,41 @@ void unhook_syscalln(int nr, void *before, void *after);
 hook_err_t hook_compat_syscalln(int nr, int narg, void *before, void *after, void *udata);
 
 void unhook_compat_syscalln(int nr, void *before, void *after);
+
+/**
+ * @brief Install the single el0_svc_common hook that backs hook_syscalln.
+ *
+ * Must run after bypass_kcfi() and after syscall_init() so the syscall-wrapper
+ * detection is available. On failure (or when el0_svc_common cannot be
+ * resolved) hook_syscalln transparently keeps using the per-syscall mechanism.
+ */
+void syscall_dispatch_init(void);
+
+/**
+ * @brief Non-zero once the global el0_svc_common hook is active.
+ */
+int syscall_hook_global_enabled(void);
+
+/**
+ * @brief Register the uid gate the dispatcher evaluates once per syscall before
+ * dispatching any callback. Returning 0 from @param gate suppresses every
+ * callback for that syscall (except slots registered with bypass_gate), so
+ * callbacks do not each need their own root check. Passing NULL disables it.
+ */
+void syscall_hook_set_gate(int (*gate)(void));
+
+/**
+ * @brief Per-syscall hook that preserves the original mechanism, including
+ * skip_origin support.
+ */
+hook_err_t hook_syscalln_legacy(int nr, int narg, void *before, void *after, void *udata);
+
+/**
+ * @brief Register a syscall hook whose before callback may set skip_origin to
+ * suppress the real syscall. Uses the global dispatcher when it is hooked at
+ * invoke_syscall (handler granularity), otherwise falls back to the per-syscall
+ * mechanism. Used by the magic supercall.
+ */
+hook_err_t hook_syscalln_override(int nr, int narg, void *before, void *after, void *udata);
 
 #endif
