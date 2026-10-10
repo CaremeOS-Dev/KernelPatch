@@ -140,7 +140,13 @@ struct pt_regs *_task_pt_reg(struct task_struct *task)
     unsigned long stack = (unsigned long)task_stack_page(task);
     uintptr_t addr = (uintptr_t)(thread_size + stack);
 #if defined(CONFIG_ARM)
-    addr -= pt_regs_offset;
+    /* AArch32: THREAD_START_SP = task_stack_page + THREAD_SIZE - 8 (the
+     * top 8 bytes of the kernel stack are reserved), and task_pt_regs sits
+     * below that: addr = THREAD_START_SP - sizeof(struct pt_regs).
+     * Without the -8 the computed regs pointer is 8 bytes too high, so
+     * user_stack_pointer() reads ARM_pc (uregs[15]) instead of ARM_sp and
+     * every copy_to_user_stack()/userd rc redirect EFAULTs (-14). */
+    addr -= pt_regs_offset + 8;
 #else
     if (pt_regs_offset > 0) {
         addr -= pt_regs_offset;

@@ -1872,20 +1872,34 @@ static void before_openat(hook_fargs4_t *args, void *udata)
         }
     }
 
-    /* Never overwrite init's filename allocation: /init.rc is shorter than
-     * REPLACE_RC_FILE, and the 64-byte table entries are not buffer sizes. */
-    uintptr_t sp = current_user_stack_pointer();
-    if (sp < sizeof(REPLACE_RC_FILE)) goto free;
-    sp = (sp - sizeof(REPLACE_RC_FILE)) & ~(uintptr_t)15;
-    cplen = compat_copy_to_user((void *__user)sp, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
-    if (cplen != sizeof(REPLACE_RC_FILE)) {
-        log_boot("redirect rc file copy error: %d\n", cplen);
-        goto free;
+    /* AArch32 (XTC port): redirect by overwriting the openat() filename
+     * buffer in place first, then fall back to the user-stack copy.
+     *
+     * The upstream (arm64) strategy copies REPLACE_RC_FILE onto the user
+     * stack via current_user_stack_pointer(), but on this 32-bit port that
+     * path EFAULTs (-14): _task_pt_reg() once missed the AArch32 top-of-stack
+     * 8-byte reserve, so ARM_sp aliased ARM_pc and the copy went to a
+     * user-unwritable address.  The in-place overwrite of the caller's
+     * filename buffer (v11 behaviour, proven on-device) does not depend on
+     * the pt_regs probe at all, so prefer it; keep the stack copy as the
+     * fallback for kernels where the filename buffer is too small.
+     *
+     * Both failure modes are safe: if neither helper works we leave arg1
+     * untouched and the real openat() proceeds with the original path. */
+    cplen = compat_copy_to_user((void *)filename, REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
+    if (cplen > 0) {
+        args->local.data0 = cplen;
+        args->local.data1 = (uint64_t)args->arg1;
+        log_boot("redirect rc file: %x\n", args->local.data0);
+    } else {
+        void *__user up = copy_to_user_stack(REPLACE_RC_FILE, sizeof(REPLACE_RC_FILE));
+        if (up && !IS_ERR(up)) {
+            args->arg1 = (uint64_t)up;
+            log_boot("redirect rc file stack: %llx\n", up);
+        } else {
+            log_boot("redirect rc file: no user memory helper, leaving openat intact\n");
+        }
     }
-    args->local.data0 = 1;
-    args->local.data1 = syscall_argn(args, 1);
-    set_syscall_argn(args, 1, sp);
-    log_boot("redirect rc file stack: %llx\n", sp);
 
 free:
     filp_close(newfp, 0);
@@ -1898,9 +1912,15 @@ out:
 
 static void after_openat(hook_fargs4_t *args, void *udata)
 {
-    if (args->local.data0) {
-        set_syscall_argn(args, 1, args->local.data1);
-        log_boot("redirect rc file open result: %ld\n", (long)args->ret);
+    if (args->local.data0 && args->local.data3 > 0) {
+        /* Restore the caller's filename buffer that before_openat()
+         * overwrote in place (data0 = cplen > 0 indicates that path). */
+        const char *origin_rc = ORIGIN_RC_FILES[args->local.data3 - 1];
+        compat_copy_to_user(
+            (void *)args->local.data1,
+            origin_rc,
+            sizeof(ORIGIN_RC_FILES[args->local.data3 - 1]));
+        log_boot("restore rc file: %x\n", args->local.data0);
     }
     if (args->local.data2) {
         unhook_syscalln(__NR_openat, before_openat, after_openat);
