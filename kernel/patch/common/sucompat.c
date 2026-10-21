@@ -606,6 +606,25 @@ int su_compat_init()
     rc = hook_compat_syscalln(387, 5, before_execveat, 0, (void *)1);
     log_boot("hook 32 __NR_execveat rc: %d\n", rc);
 
+    /* REGRESSION FIX (v11 -> 0.13.9): the merge extracted the getname_flags
+     * hook into su_hook_getname_flags() but never called it, so the hook was
+     * dead code and `su` disappeared from the shell.
+     *
+     * after_getname_flags() rewrites struct filename->name from the su path to
+     * /system/bin/sh for granted uids, so `stat()`/`access()` on the su path
+     * reports it present.  A shell resolves a command with stat()/access()
+     * BEFORE execve(), so without this hook mksh sees ENOENT, prints
+     * "su: not found" and never reaches the before_execve() redirect that
+     * actually grants root.  v11 called hook_wrap3() on getname_flags inline
+     * here; 0.13.9 lost that call.
+     *
+     * This is the getname_flags wrap (an after-hook on struct filename), NOT
+     * the fstatat/faccessat path-probe hooks that the AArch32 safety gate in
+     * su_register_path_probe_hooks() still keeps disabled.  It was live in v11
+     * and is independent of the EFAULT storm that gate guards against. */
+    rc = su_hook_getname_flags();
+    log_boot("hook getname_flags rc: %d\n", rc);
+
     su_register_path_probe_hooks();
 
     return 0;
