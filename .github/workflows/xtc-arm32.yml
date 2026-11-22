@@ -87,6 +87,20 @@ jobs:
 
           md5sum "$B" | tee kpimg-arm-full.md5
 
+          # Reproducibility against the build we verified on hardware.
+          # Everything the compiler emits is deterministic; the only field that
+          # moves is the 24-byte compile_time string at 0x18..0x2F. Mask it and
+          # the blob must be bit-identical to the device-verified one -- that is
+          # the check that would have caught a debug/spin-entry variant.
+          cp "$B" /tmp/kpimg-masked
+          dd if=/dev/zero of=/tmp/kpimg-masked bs=1 seek=24 count=24 conv=notrunc status=none
+          masked=$(md5sum /tmp/kpimg-masked | cut -d' ' -f1)
+          echo "compile_time-masked md5: $masked"
+          if [ "$masked" != "a877658041bd9b3ce19b7095cb4bc40b" ]; then
+            echo "::error::blob differs from the device-verified build outside compile_time"
+            exit 1
+          fi
+
       - name: Smoke test with kptools
         run: |
           set -euo pipefail
