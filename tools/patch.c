@@ -242,6 +242,25 @@ static char *bytes_to_hexstr(const unsigned char *data, int len)
     return buf;
 }
 
+/* The preset header has no ARM32 flag (upstream only tracks CONFIG_FLAG_X86_64),
+ * so "-l -k kpimg" used to report every non-x86 blob as "arm64" even for the
+ * AArch32 port.  Derive the arch from the blob's entry instruction (kpimg links
+ * its entry at 0x1000) and report it correctly:
+ *   A32 b/bl : cond 000 101 imm24  -> bits 27..25 == 101
+ *   A64 b/bl : 000101 imm26        -> (w & 0x7C000000) == 0x14000000
+ */
+static int g_kpimg_is_arm32 = -1;   /* -1 = unknown -> keep the old label */
+
+static int blob_entry_is_arm32(const char *blob, int len)
+{
+    uint32_t w;
+    if (!blob || len < 0x1004) return -1;
+    memcpy(&w, blob + 0x1000, sizeof(w));
+    if ((w & 0x7C000000u) == 0x14000000u) return 0;
+    if (((w >> 25) & 7u) == 5u && ((w >> 28) & 0xFu) != 0xFu) return 1;
+    return -1;
+}
+
 void print_preset_info(preset_t *preset)
 {
     setup_header_t *header = &preset->header;
@@ -256,7 +275,8 @@ void print_preset_info(preset_t *preset)
     fprintf(stdout, "version=0x%x\n", ver_num);
     fprintf(stdout, "compile_time=%s\n", header->compile_time);
     fprintf(stdout, "config=%s,%s\n", is_android ? "android" : "linux", is_debug ? "debug" : "release");
-    fprintf(stdout, "arch=%s\n", is_x86_64 ? "x86_64" : "arm64");
+    fprintf(stdout, "arch=%s\n",
+            is_x86_64 ? "x86_64" : (g_kpimg_is_arm32 == 1 ? "arm32" : "arm64"));
     fprintf(stdout, "superkey=%s\n", setup->superkey);
 
     // todo: remove compat version
@@ -295,6 +315,7 @@ int print_kp_image_info_path(const char *kpimg_path)
     if (get_preset(kpimg, len) != preset) {
         rc = -ENOENT;
     } else {
+        g_kpimg_is_arm32 = blob_entry_is_arm32(kpimg, len);
         print_preset_info(preset);
         fprintf(stdout, "\n");
         free(kpimg);
@@ -840,7 +861,9 @@ int patch_update_img_buf(const char *kimg, int kimg_len, const char *kpimg_path,
     tools_logi("kpimg version: %x\n", ver_num);
     tools_logi("kpimg compile time: %s\n", header->compile_time);
     tools_logi("kpimg config: %s, %s, %s\n", is_android ? "android" : "linux",
-               is_debug ? "debug" : "release", is_x86_64 ? "x86_64" : "arm64");
+               is_debug ? "debug" : "release",
+               is_x86_64 ? "x86_64"
+                         : (blob_entry_is_arm32(kpimg, kpimg_len) == 1 ? "arm32" : "arm64"));
 
     setup_preset_t *setup = &preset->setup;
     memset(setup, 0, sizeof(preset->setup));
