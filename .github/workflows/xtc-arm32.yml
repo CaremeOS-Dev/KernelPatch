@@ -1,0 +1,196 @@
+name: XTC ARM32
+
+# Builds the AArch32 (ARMv7-A) KernelPatch blob and the kptools that consume it.
+# Upstream's build.yml only runs on workflow_call/dispatch and only produces the
+# aarch64 blob, so nothing here is covered by it.
+on:
+  push:
+    branches: [ "main" ]
+    tags: [ "*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+concurrency:
+  group: xtc-arm32-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  kpimg-arm32:
+    name: kpimg (ARMv7-A, A32)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read version
+        id: ver
+        run: |
+          MAJOR=$(grep '#define MAJOR' version | awk '{print $3}')
+          MINOR=$(grep '#define MINOR' version | awk '{print $3}')
+          PATCH=$(grep '#define PATCH' version | awk '{print $3}')
+          echo "VERSION=$MAJOR.$MINOR.$PATCH" >> "$GITHUB_OUTPUT"
+          echo "MAJOR=$MAJOR" >> "$GITHUB_OUTPUT"
+          echo "MINOR=$MINOR" >> "$GITHUB_OUTPUT"
+          echo "PATCH=$PATCH" >> "$GITHUB_OUTPUT"
+          cat version
+
+      - name: Install the ARM cross toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-arm-linux-gnueabi binutils-arm-linux-gnueabi
+          arm-linux-gnueabi-gcc --version | head -1
+
+      # kernel/kpimg-arm-full is a build artifact (not tracked): the blob the
+      # manager ships is whatever this job produced, so it must be built from
+      # source every time instead of being taken from a developer's tree.
+      - name: Build the blob
+        run: |
+          cd kernel
+          find . -name '*.arm.o' -delete
+          make -f Makefile.arm full-link CROSS=arm-linux-gnueabi- ANDROID=1
+
+      - name: Verify the blob
+        run: |
+          set -euo pipefail
+          B=kernel/kpimg-arm-full
+          ls -l "$B" kernel/kpimg-arm-full.elf
+
+          readelf -h kernel/kpimg-arm-full.elf | grep -E 'Class|Machine|Entry'
+          readelf -h kernel/kpimg-arm-full.elf | grep -q 'ELF32'
+          readelf -h kernel/kpimg-arm-full.elf | grep -q 'Machine:.*ARM'
+
+          # The injected blob starts with the kpimg header: magic + version.
+          # version_t is {_, patch, minor, major}: the three bytes after the
+          # 8-byte magic are patch at +1, minor at +2, major at +3.
+          magic=$(head -c 6 "$B")
+          hdr_major=$(od -An -tu1 -j11 -N1 "$B" | tr -d ' ')
+          hdr_minor=$(od -An -tu1 -j10 -N1 "$B" | tr -d ' ')
+          hdr_patch=$(od -An -tu1 -j9  -N1 "$B" | tr -d ' ')
+          echo "magic='$magic' header version $hdr_major.$hdr_minor.$hdr_patch size $(stat -c %s "$B") md5 $(md5sum "$B" | cut -d' ' -f1)"
+          [ "$magic" = "KP1158" ] || { echo "::error::bad kpimg magic"; exit 1; }
+          [ "$hdr_major" = "${{ steps.ver.outputs.MAJOR }}" ] || { echo "::error::header major mismatch"; exit 1; }
+          [ "$hdr_minor" = "${{ steps.ver.outputs.MINOR }}" ] || { echo "::error::header minor mismatch"; exit 1; }
+          [ "$hdr_patch" = "${{ steps.ver.outputs.PATCH }}" ] || { echo "::error::header patch mismatch"; exit 1; }
+          [ $(( $(stat -c %s "$B") % 4 )) -eq 0 ] || { echo "::error::blob size is not 4-byte aligned"; exit 1; }
+
+          # Position independence: a GOT would mean link2runtime() cannot fix up
+          # the baked addresses and the kernel faults on a low VA.
+          if nm kernel/kpimg-arm-full.elf | grep -Eq ' (GOT|PLT)'; then
+            echo "::error::blob has GOT/PLT relocations"
+            exit 1
+          fi
+          echo "no GOT/PLT symbols"
+
+          md5sum "$B" | tee kpimg-arm-full.md5
+
+      - name: Smoke test with kptools
+        run: |
+          set -euo pipefail
+          TARGET_COMPILE=placeholder make -C kernel hdr
+          make -C tools -j"$(nproc)"
+          # kptools reads the header and must report the same version (d09).
+          got=$(./tools/kptools -i kernel/kpimg-arm-full -v)
+          want=$(printf '%x' $(( (0 << 16) | (${{ steps.ver.outputs.MINOR }} << 8) | ${{ steps.ver.outputs.PATCH }} )))
+          echo "kptools reports $got, expected $want"
+          [ "$got" = "$want" ] || { echo "::error::kptools version mismatch"; exit 1; }
+
+      - name: Upload the blob
+        uses: actions/upload-artifact@v4
+        with:
+          name: kpimg-arm-full
+          path: |
+            kernel/kpimg-arm-full
+            kernel/kpimg-arm-full.elf
+            kpimg-arm-full.md5
+
+  kptools:
+    name: kptools (linux, android arm64+armv7)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake zlib1g-dev
+
+      - name: Generate the shared headers
+        run: TARGET_COMPILE=placeholder make -C kernel hdr
+
+      - name: Build kptools (linux)
+        run: |
+          make -C tools -j"$(nproc)"
+          ./tools/kptools 2>&1 | head -3
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27b
+          add-to-path: true
+
+      - name: Build kptools (android arm64-v8a + armeabi-v7a)
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a armeabi-v7a; do
+            echo "== $abi =="
+            mkdir -p "tools/build/$abi"
+            cd "tools/build/$abi"
+            cmake -DCMAKE_TOOLCHAIN_FILE=${{ steps.ndk.outputs.ndk-path }}/build/cmake/android.toolchain.cmake \
+                  -DCMAKE_BUILD_TYPE=Release \
+                  -DANDROID_PLATFORM=android-26 \
+                  -DANDROID_ABI="$abi" ../..
+            cmake --build . -j"$(nproc)"
+            ${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip kptools
+            mv kptools "kptools-$abi"
+            ls -l "kptools-$abi"
+            cd - >/dev/null
+          done
+
+      - name: Upload kptools
+        uses: actions/upload-artifact@v4
+        with:
+          name: kptools
+          path: |
+            tools/build/arm64-v8a/kptools-arm64-v8a
+            tools/build/armeabi-v7a/kptools-armeabi-v7a
+            tools/kptools
+
+  release:
+    name: Publish release
+    needs: [ kpimg-arm32, kptools ]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd out
+          ls -l
+          md5sum kpimg-arm-full kptools-armeabi-v7a kptools-arm64-v8a > MD5SUMS
+          cat MD5SUMS
+      - name: Release
+        uses: ncipollo/release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ github.ref_name }}
+          artifacts: |
+            out/kpimg-arm-full
+            out/kpimg-arm-full.elf
+            out/kptools-armeabi-v7a
+            out/kptools-arm64-v8a
+            out/MD5SUMS
+          generateReleaseNotes: true
+          replacesArtifacts: true
+          allowUpdates: true
