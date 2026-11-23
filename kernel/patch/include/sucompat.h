@@ -47,4 +47,12 @@ void sucompat_unregister_path_probe_hooks(void);
  * state: 1=enable, 0=disable, -1=query current state. */
 long kp_control_feature_sc(const char __user *uname, int state);
 
+/* ---- SU prompt (弹窗确认) support ----
+ * Off by default. Enable with kp_control_feature_sc("su_prompt", 1).
+ * When on, a su exec from a uid outside the su whitelist is parked in an
+ * interruptible wait until a trusted manager supplies a decision. */
+int su_prompt_enabled(void);
+int su_prompt_poll(struct su_request __user *out_reqs, int max);
+int su_prompt_decision(pid_t pid, int decision);
+
 #endif
