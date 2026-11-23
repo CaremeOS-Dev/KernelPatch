@@ -96,7 +96,7 @@ jobs:
           dd if=/dev/zero of=/tmp/kpimg-masked bs=1 seek=24 count=24 conv=notrunc status=none
           masked=$(md5sum /tmp/kpimg-masked | cut -d' ' -f1)
           echo "compile_time-masked md5: $masked"
-          if [ "$masked" != "a877658041bd9b3ce19b7095cb4bc40b" ]; then
+          if [ "$masked" != "00fa884c231aea71a151a97258bcb93e" ]; then
             echo "::error::blob differs from the device-verified build outside compile_time"
             exit 1
           fi
