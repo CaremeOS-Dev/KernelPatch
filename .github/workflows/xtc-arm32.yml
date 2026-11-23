@@ -186,12 +186,22 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: out
-          merge-multiple: true
+          path: raw
+
+      # The artifacts keep their build paths (kernel/..., tools/build/<abi>/...),
+      # so flatten them into out/ before publishing.
+      - name: Collect artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find raw -type f \( -name 'kpimg-arm-full' -o -name 'kpimg-arm-full.elf' -o -name 'kptools-*' \) \
+               -exec cp -v {} out/ \;
+          ls -l out
+
       - name: Checksums
         run: |
+          set -euo pipefail
           cd out
-          ls -l
           md5sum kpimg-arm-full kptools-armeabi-v7a kptools-arm64-v8a > MD5SUMS
           cat MD5SUMS
       - name: Release
