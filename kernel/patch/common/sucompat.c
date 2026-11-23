@@ -55,6 +55,12 @@ static const char *current_su_path = 0;
 
 static int su_kstorage_gid = -1;
 static int exclude_kstorage_gid = -1;
+static int su_prompt_kstorage_gid = -1;
+static volatile int su_prompt_on = 0;   /* off by default; toggled via control_feature("su_prompt") */
+/* KernelPatch is freestanding: no sleep/wait primitives. The kernel only
+ * records a pending request in kstorage (group 2, key=pid) and still elevates
+ * + execs apd as usual. The blocking "wait for user tap" runs in apd (userspace).
+ */
 /* 1 while su_register_path_probe_hooks() has the fstatat/faccessat probes
  * installed.  Stays 0 under the AArch32 safety gate so the unregister path
  * never unwraps a hook that was never installed. */
@@ -72,6 +78,14 @@ long kp_control_feature_sc(const char __user *uname, int state)
 
     if (!strcmp(name, "selinux_hide")) {
         return selinux_hide_control(state);
+    }
+
+    if (!strcmp(name, "su_prompt")) {
+        if (state >= 0) {
+            __atomic_store_n(&su_prompt_on, state ? 1 : 0, __ATOMIC_RELAXED);
+            logkfi("su_prompt %s\n", state ? "enabled" : "disabled");
+        }
+        return __atomic_load_n(&su_prompt_on, __ATOMIC_RELAXED);
     }
 
     if (!strcmp(name, "sucompat_extra") || !strcmp(name, "path_probe")) {
@@ -141,6 +155,74 @@ int is_su_allow_uid(uid_t uid)
     return granted;
 }
 KP_EXPORT_SYMBOL(is_su_allow_uid);
+
+/* ---- SU prompt: pending-request plumbing ---------------------------------- */
+
+int su_prompt_enabled(void)
+{
+    return __atomic_load_n(&su_prompt_on, __ATOMIC_RELAXED);
+}
+KP_EXPORT_SYMBOL(su_prompt_enabled);
+
+struct su_prompt_poll_ctx {
+    struct su_request *kernel_buf;
+    int max;
+    int idx;
+};
+
+static int su_prompt_poll_cb(struct kstorage *ks, void *udata)
+{
+    struct su_prompt_poll_ctx *ctx = (struct su_prompt_poll_ctx *)udata;
+    if (ctx->idx >= ctx->max) return -ENOBUFS;
+    if (ks->dlen < (int)sizeof(struct su_request)) return 0;
+
+    struct su_request *req = (struct su_request *)ks->data;
+    if (req->decision != SU_DECISION_PENDING) return 0;
+
+    memcpy(&ctx->kernel_buf[ctx->idx], req, sizeof(struct su_request));
+    ctx->idx++;
+    return 0;
+}
+
+int su_prompt_poll(struct su_request __user *out_reqs, int max)
+{
+    if (!out_reqs || max <= 0 || max > 64) return -EINVAL;
+
+    struct su_request *buf = vmalloc(sizeof(struct su_request) * max);
+    if (!buf) return -ENOMEM;
+
+    struct su_prompt_poll_ctx ctx = { buf, max, 0 };
+    /* on_each_kstorage_elem() walks under rcu_read_lock(): copy into a kernel
+     * buffer here, do the (sleeping) copy_to_user only after the walk ends. */
+    on_each_kstorage_elem(su_prompt_kstorage_gid, su_prompt_poll_cb, &ctx);
+
+    int n = ctx.idx;
+    if (n > 0) {
+        long copied = compat_copy_to_user(out_reqs, buf, sizeof(struct su_request) * n);
+        if (copied <= 0) n = -EFAULT;
+    }
+    kvfree(buf);
+    return n;
+}
+KP_EXPORT_SYMBOL(su_prompt_poll);
+
+int su_prompt_decision(pid_t pid, int decision)
+{
+    struct su_request req;
+    long rc = read_kstorage(su_prompt_kstorage_gid, (long)pid, &req, 0, sizeof(req), false);
+    if (rc < 0) return -ENOENT;
+
+    /* A duplicate/late decision must not revive an already-finished request. */
+    if (req.decision != SU_DECISION_PENDING) return 0;
+
+    req.decision = decision;
+    rc = write_kstorage(su_prompt_kstorage_gid, (long)pid, &req, 0, sizeof(req), false);
+    /* apd polls this kstorage record from userspace; no kernel wakeup needed. */
+    logkfi("su_prompt decision pid: %d, uid: %d, decision: %d, rc: %ld\\n",
+           pid, req.uid, decision, rc);
+    return rc;
+}
+KP_EXPORT_SYMBOL(su_prompt_decision);
 
 int su_add_allow_uid(uid_t uid, uid_t to_uid, const char *scontext)
 {
@@ -265,7 +347,13 @@ KP_EXPORT_SYMBOL(su_get_path);
 static void handle_before_execve(char **__user u_filename_p, char **__user uargv, void *udata)
 {
     uid_t uid = current_uid();
-    if (!is_su_allow_uid(uid) && !is_trusted_manager_uid(uid)) return;
+    int trusted = is_trusted_manager_uid(uid);
+    int allowed = is_su_allow_uid(uid);
+    /* Only a non-whitelisted caller can enter prompt mode, and only when the
+     * trusted manager explicitly enabled the feature via control_feature. */
+    int prompt_mode = !trusted && !allowed && su_prompt_enabled();
+
+    if (!trusted && !allowed && !prompt_mode) return;
 
     char __user *ufilename = *u_filename_p;
     char filename[SU_PATH_MAX_LEN];
@@ -273,36 +361,56 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
     if (flen <= 0) return;
 
 #ifdef ANDROID
-    // Match the configured su path (default /system/bin/kp) and the legacy
-    // /system/bin/su that shells and detectors also exec. execve does not go
-    // through getname_flags, so this before-hook is the only place to redirect
-    // a real exec of /system/bin/su to sh/apd.
-    if (strcmp(filename, current_su_path) && strcmp(filename, legacy_su_path)) {
-        if (!strcmp(SUPERCMD, filename)) {
-            void handle_supercmd(char **__user u_filename_p, char **__user uargv);
-            handle_supercmd(u_filename_p, uargv);
-        }
-        return;
-    }
+    int matched_su = !strcmp(filename, current_su_path) || !strcmp(filename, legacy_su_path);
 #else
-    if (strcmp(filename, current_su_path)) {
-        if (!strcmp(SUPERCMD, filename)) {
+    int matched_su = !strcmp(filename, current_su_path);
+#endif
+    if (!matched_su) {
+        /* SUPERCMD stays exclusive to whitelisted/trusted callers: a prompt-mode
+         * caller must not be able to redirect an ordinary truncate invocation. */
+        if ((trusted || allowed) && !strcmp(SUPERCMD, filename)) {
             void handle_supercmd(char **__user u_filename_p, char **__user uargv);
             handle_supercmd(u_filename_p, uargv);
         }
         return;
     }
-#endif
-    {
-        uid_t uid = current_uid();
-        struct su_profile profile = { .to_uid = 0 };
-        if (is_trusted_manager_uid(uid)) {
-            strncpy(profile.scontext, all_allow_sctx, sizeof(profile.scontext) - 1);
-            profile.scontext[sizeof(profile.scontext) - 1] = '\0';
-        } else if (su_allow_uid_profile(0, uid, &profile)) {
-            return;
-        }
 
+    struct su_profile profile = { .to_uid = 0 };
+
+    if (prompt_mode) {
+        pid_t pid = (pid_t)task_pid_vnr(current);
+        /* Stack-allocated: this KP blob does not resolve kmalloc/kzalloc kfuncs
+         * (see supercmd.c), and GFP_KERNEL is not defined in freestanding KP. */
+        struct su_request req;
+        memset(&req, 0, sizeof(req));
+        req.uid = uid;
+        req.to_uid = 0;
+        req.pid = pid;
+        req.decision = SU_DECISION_PENDING;
+        strncpy(req.scontext, all_allow_sctx, sizeof(req.scontext) - 1);
+        req.scontext[sizeof(req.scontext) - 1] = '\0';
+        memset(req.comm, 0, sizeof(req.comm));
+        /* No stamp: freestanding KP has no jiffies/ktime. */
+        long wrc = write_kstorage(su_prompt_kstorage_gid, (long)pid, &req, 0, sizeof(req), false);
+        if (wrc < 0) return;
+
+        logkfi("su_prompt pending uid: %d, pid: %d (apd will arbitrate)\n", uid, pid);
+        /* Do NOT sleep: elevate + exec apd as usual, and let apd block in
+         * userspace until the manager writes ALLOW/DENY into this kstorage. */
+        strncpy(profile.scontext, all_allow_sctx, sizeof(profile.scontext) - 1);
+        profile.scontext[sizeof(profile.scontext) - 1] = '\0';
+        goto commit_and_redirect;
+    }
+
+    if (trusted) {
+        strncpy(profile.scontext, all_allow_sctx, sizeof(profile.scontext) - 1);
+        profile.scontext[sizeof(profile.scontext) - 1] = '\0';
+    } else if (su_allow_uid_profile(0, uid, &profile)) {
+        return;
+    }
+
+commit_and_redirect:
+    {
         uid_t to_uid = profile.to_uid;
         const char *sctx = profile.scontext;
         commit_su(to_uid, sctx);
@@ -315,22 +423,13 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
             if (uptr && !IS_ERR(uptr)) {
                 *u_filename_p = (char *__user)uptr;
             }
-            logkfi("call su uid: %d, to_uid: %d, sctx: %s, uptr: %llx\n", uid, to_uid, sctx,
+            logkfi("call su uid: %d, to_uid: %d, sctx: %s, uptr: %llx\\n", uid, to_uid, sctx,
                    (unsigned long long)(unsigned long)uptr);
 #ifdef ANDROID
         } else {
             filp_close(filp, 0);
 
-            // command
 #if defined(CONFIG_ARM)
-            /* AArch32 (ILP32): uintptr_t is 4 bytes.  `uint64_t sp` passed to
-             * compat_copy_to_user()'s 32-bit (void __user *) parameter made
-             * AAPCS pass the HIGH half of the 64-bit value (r4) instead of the
-             * address -- the call then failed with -EFAULT and the whole
-             * /system/bin/su -> apd redirect silently broke.  The v8 boot log
-             * shows it verbatim:
-             *     handle_before_execve: call apd uid: 0, ..., cplen: -14, 0
-             * (identical pattern to the supercmd.c:460 fix). */
             uintptr_t sp = 0;
 #else
             uint64_t sp = 0;
@@ -343,7 +442,6 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
                 *u_filename_p = (char *)sp;
             }
 
-            // argv
             int argv_cplen = 0;
             if (strcmp(legacy_su_path, filename)) {
                 if (argv_cplen <= 0) {
@@ -353,14 +451,14 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
                     argv_cplen = compat_copy_to_user((void *)sp, legacy_su_path, sizeof(legacy_su_path));
                     if (argv_cplen > 0) {
                         int rc = set_user_arg_ptr(0, *uargv, 0, sp);
-                        if (rc < 0) { // todo: modify entire argv
-                            logkfi("call apd argv error, uid: %d, to_uid: %d, sctx: %s, rc: %d\n", uid, to_uid, sctx,
+                        if (rc < 0) {
+                            logkfi("call apd argv error, uid: %d, to_uid: %d, sctx: %s, rc: %d\\n", uid, to_uid, sctx,
                                    rc);
                         }
                     }
                 }
             }
-            logkfi("call apd uid: %d, to_uid: %d, sctx: %s, cplen: %d, %d\n", uid, to_uid, sctx, cplen, argv_cplen);
+            logkfi("call apd uid: %d, to_uid: %d, sctx: %s, cplen: %d, %d\\n", uid, to_uid, sctx, cplen, argv_cplen);
         }
 #endif // ANDROID
     }
@@ -564,6 +662,9 @@ int su_compat_init()
 
     exclude_kstorage_gid = try_alloc_kstroage_group();
     if (exclude_kstorage_gid != KSTORAGE_EXCLUDE_LIST_GROUP) return -ENOMEM;
+
+    su_prompt_kstorage_gid = try_alloc_kstroage_group();
+    if (su_prompt_kstorage_gid != KSTORAGE_UNUSED_GROUP_2) return -ENOMEM;
 
 #ifdef ANDROID
     // default shell

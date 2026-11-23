@@ -123,6 +123,30 @@ static const struct trusted_manager_entry trusted_managers[] = {
             0xa1, 0x00, 0xdd, 0x87, 0xba, 0x64, 0x0b, 0xc7
         }
     },
+    /*
+     * >>> SU PROMPT: TRUSTED MANAGER INTEGRATION POINT <<<
+     * The SU_PENDING_POLL / SU_DECISION supercalls are gated on is_authed,
+     * which for a signature-authorized kernel means is_trusted_manager_uid().
+     * To let YOUR manager drive the su prompt, add its entry here:
+     *
+     *   1) compute the signer certificate DER SHA-256 of your signed APK:
+     *        python3 tools/apk_cert_digest.py your-manager.apk
+     *      (or: openssl x509 -inform DER -fingerprint -sha256 < cert.der)
+     *   2) put the 32 digest bytes below and set applicationId in `package`.
+     *   3) rebuild kpimg and re-patch the kernel (this table is compile-time).
+     *
+     * The all-zero digest below matches no certificate, so leaving it in
+     * place is harmless: only the two real entries above stay trusted.
+     */
+    {
+        "com.yourcompany.mymanager",
+        {
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        }
+    },
     { "", { 0 } }
 };
 

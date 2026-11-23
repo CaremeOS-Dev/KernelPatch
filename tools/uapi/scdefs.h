@@ -126,7 +126,46 @@ struct su_profile
 #define SUPERCALL_SU_RESET_PATH 0x1111
 #define SUPERCALL_SU_GET_SAFEMODE 0x1112
 
+/*
+ * SU prompt (弹窗确认) extension.
+ *
+ * Standard APatch is a whitelist: handle_before_execve() grants root the moment
+ * the calling uid is in the su list. These two commands add a confirmation
+ * stage for uids that are NOT in the whitelist: the kernel parks the su exec in
+ * an interruptible wait, exposes the pending request to the trusted manager via
+ * SUPERCALL_SU_PENDING_POLL, and only calls commit_su() after the manager replies
+ * SUPERCALL_SU_DECISION(ALLOW).
+ *
+ * Both commands live in the is_authed gate (superkey or trusted-manager uid),
+ * so a whitelisted third-party app cannot manufacture its own ALLOW decision.
+ */
+#define SUPERCALL_SU_PENDING_POLL 0x1113
+#define SUPERCALL_SU_DECISION     0x1114
 
+/* Decision values written back by the manager (and read back by the kernel). */
+#define SU_DECISION_PENDING  0
+#define SU_DECISION_ALLOW    1
+#define SU_DECISION_DENY    (-1)
+#define SU_DECISION_TIMEOUT (-2)
+
+#define SU_REQ_COMM_LEN 16
+
+/*
+ * One pending su request. Stored in kstorage group KSTORAGE_UNUSED_GROUP_2,
+ * keyed by the requesting process tgid so concurrent requests do not collide.
+ * The kernel writes it before waiting; the manager reads a snapshot through
+ * PENDING_POLL and writes only the `decision` field back via SU_DECISION.
+ */
+struct su_request
+{
+    uid_t uid;                              /* requesting app uid */
+    uid_t to_uid;                           /* target uid, normally 0 (root) */
+    pid_t pid;                              /* requesting tgid, decision key */
+    unsigned long stamp;                    /* jiffies when queued */
+    int decision;                           /* one of SU_DECISION_* */
+    char scontext[SUPERCALL_SCONTEXT_LEN];  /* proposed SELinux context */
+    char comm[SU_REQ_COMM_LEN];             /* process comm, display hint only */
+};
 
 #define SUPERCALL_MAX 0x1200
 
