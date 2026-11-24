@@ -23,9 +23,6 @@ on:
 permissions:
   contents: read
 
-env:
-  VERIFIED_BLOB_MD5: a877658041bd9b3ce19b7095cb4bc40b
-
 jobs:
   guard:
     runs-on: ubuntu-latest
@@ -67,15 +64,24 @@ jobs:
           done
           exit $status
 
-      - name: kpimg pin changes need a hardware attestation
+      - name: kpimg pin changes need an attestation
         env:
           PULL_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
           pin=$(grep -oE '\b[0-9a-f]{32}\b' .github/workflows/xtc-arm32.yml | head -1 || true)
-          echo "pin in workflow: $pin"
-          if [ "$pin" = "$VERIFIED_BLOB_MD5" ]; then
-            echo "pin unchanged (device-verified blob)"
+          # Compare against the base branch, not a hard-coded constant: the pin
+          # legitimately moves when a kernel change is verified, and every later
+          # PR would otherwise be flagged for inheriting it.
+          base_pin=$(git show "origin/${{ github.base_ref }}:.github/workflows/xtc-arm32.yml" 2>/dev/null \
+                     | grep -oE '\b[0-9a-f]{32}\b' | head -1 || true)
+          echo "pin on base: ${base_pin:-<none>}   pin in PR: ${pin:-<none>}"
+          if [ -z "$pin" ]; then
+            echo "::error::cannot find the blob pin in .github/workflows/xtc-arm32.yml"
+            exit 1
+          fi
+          if [ "$pin" = "$base_pin" ]; then
+            echo "pin unchanged in this PR"
             exit 0
           fi
           if printf '%s' "$PULL_BODY" | grep -qiE "Blob-Verified:[[:space:]]*$pin"; then
@@ -85,7 +91,7 @@ jobs:
             # flashed yet, and says why. Greppable forever in the PR.
             echo "pin change approved without a hardware test (pre-release)"
           else
-            echo "::error::the kpimg pin moved to '$pin' without an attestation."
+            echo "::error::the kpimg pin moved from '${base_pin:-none}' to '$pin' without an attestation."
             echo "Either 'Blob-Verified: $pin' (flashed, boot + su confirmed) or"
             echo "'Blob-Approved: $pin <reason>' (maintainer accepts an untested blob on purpose)."
             exit 1
