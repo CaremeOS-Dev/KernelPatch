@@ -48,6 +48,12 @@ const char default_su_path[] = SU_PATH;
  * getname_flags rewrite turning it into /system/bin/sh. Must never exist. */
 static const char denied_su_path[] = "/system/bin/.su-refused-by-kpatch";
 
+/* udata bits for the fstatat/faccessat probes: bit0 = the syscall dispatcher
+ * already gated by uid, bit1 = this registration is the access-class probe whose
+ * path must stay hidden from un-granted uids. */
+#define SU_PROBE_GATED  ((uintptr_t)1)
+#define SU_PROBE_ACCESS ((uintptr_t)2)
+
 #ifdef ANDROID
 const char legacy_su_path[] = LEGACY_SU_PATH;
 const char apd_path[] = APD_PATH;
@@ -76,6 +82,9 @@ extern void kfunc_def(msleep)(unsigned int msecs);
  * installed.  Stays 0 under the AArch32 safety gate so the unregister path
  * never unwraps a hook that was never installed. */
 static int su_path_probe_hooks_active = 0;
+/* Off by default; controlFeature("path_probe") turns the stat/access split on.
+ * Kept runtime-only so a bad interaction cannot survive a reboot. */
+static int su_path_probe_enabled_flag = 0;
 static void su_register_path_probe_hooks(void);
 static void su_unregister_path_probe_hooks(void);
 static int su_hook_getname_flags(void);
@@ -109,12 +118,16 @@ long kp_control_feature_sc(const char __user *uname, int state)
 
     if (!strcmp(name, "sucompat_extra") || !strcmp(name, "path_probe")) {
         if (state < 0)
-            /* Query: check if the hooks are currently registered. */
-            return 0;   /* not tracked */
-        if (state)
+            return su_path_probe_hooks_active;
+        if (state) {
+            /* Runtime-only on purpose: if the probes misbehave, a reboot clears
+             * this without the user having to reach a shell first. */
+            __atomic_store_n(&su_path_probe_enabled_flag, 1, __ATOMIC_RELAXED);
             su_register_path_probe_hooks();
-        else
+        } else {
             su_unregister_path_probe_hooks();
+            __atomic_store_n(&su_path_probe_enabled_flag, 0, __ATOMIC_RELAXED);
+        }
         logkfi("sucompat_extra %s via supercall\n",
                state ? "enabled" : "disabled");
         return 0;
@@ -691,17 +704,13 @@ __maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args,
 {
     uid_t uid = current_uid();
 
-    /* A caller that may still be prompted has to *see* /system/bin/su, otherwise
-     * the shell's own PATH search fails and it prints "su: not found" without ever
-     * calling execve() -- the prompt could never fire. That is the trade-off of a
-     * virtual su path: either it is visible and interceptable, or hidden and
-     * unreachable. Denied uids (is_su_deny_uid) are excluded by
-     * su_prompt_reachable(), so refusing an app also hides su from it again. */
-    /* In global-dispatcher mode the dispatcher already gated this callback on the
-     * caller's uid (su_syscall_gate), so the check would be redundant; the legacy
-     * per-syscall fallback has no gate, so it must stay there. udata == 1 marks a
-     * gated registration. */
-    if (!udata && uid != 0 && !is_su_allow_uid(uid) && !is_trusted_manager_uid(uid)) return;
+    int gated = ((uintptr_t)udata & SU_PROBE_GATED) != 0;
+    int is_access = ((uintptr_t)udata & SU_PROBE_ACCESS) != 0;
+
+    int granted = (uid == 0) || is_su_allow_uid(uid) || is_trusted_manager_uid(uid);
+    int promptable = su_prompt_reachable(uid);
+
+    if (!gated && !granted && !promptable) return;
 
     char __user **u_filename_p = (char __user **)syscall_argn_p(args, 1);
 
@@ -714,8 +723,18 @@ __maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args,
 #else
     if (strcmp(filename, current_su_path)) return;
 #endif
+
+    /*
+     * This is the decoupling that getname_flags cannot do: stat/fstatat is how a
+     * shell finds the command, access is how `which` and root-detectors probe it.
+     * A uid that can still be prompted gets stat -> /system/bin/sh (findable, so
+     * the shell reaches execve and can be prompted) but access -> a path that
+     * cannot exist (so `which su` reports nothing).
+     */
+    const char *target = (is_access && !granted && promptable) ? denied_su_path : sh_path;
+
     {
-        void *uptr = copy_to_user_stack(sh_path, sizeof(sh_path));
+        void *uptr = copy_to_user_stack(target, strlen(target) + 1);
         if (uptr && !IS_ERR(uptr)) {
             *u_filename_p = uptr;
         } else {
@@ -986,28 +1005,52 @@ static void su_register_path_probe_hooks(void)
      *
      * Re-enable only after the EFAULT mechanism above is understood; keeping a
      * booting device is worth more than an su-probe nicety.
+     *
+     * UPDATE (su prompt, v11312): the mechanism is now understood.
+     * hook_compat_syscalln() needs compat_sys_call_table, which does not exist on
+     * an AArch32 kernel, so it silently fell through to inline_wrap_syscalln() --
+     * an INLINE hook inside sys_fstatat64/sys_faccessat, on the very functions
+     * hook_syscalln() had already wrapped via sys_call_table[]. The same function
+     * carried both a table wrapper and an inline trampoline, and the inline
+     * trampoline resolved its target through the *compat* kallsyms name table,
+     * which on ARM32 does not describe these functions at all. The two probes are
+     * therefore pointless here and are no longer registered; only the native
+     * table hooks remain (fstatat64=327, faccessat=334, per the ARM EABI table).
+     *
+     * The probes still stay OFF by default: they only pay off for the su prompt
+     * (hiding /system/bin/su from access(), which is what `which` and root
+     * detectors use, while stat() keeps it findable for the shell). Turn them on
+     * with controlFeature("path_probe", 1) when that trade-off is wanted.
      */
-    log_boot("sucompat: path probe hooks DISABLED (AArch32 safety, see sucompat.c)\n");
-    return;
+    if (!__atomic_load_n(&su_path_probe_enabled_flag, __ATOMIC_RELAXED)) {
+        log_boot("sucompat: path probe hooks disabled (enable with feature path_probe)\n");
+        return;
+    }
 
     hook_err_t rc;
 
-    /* udata == 1 tells the callback the dispatcher gate already handled the uid
-     * check; without the global dispatcher it must do the check itself. */
-    void *gated = syscall_hook_global_enabled() ? (void *)1 : (void *)0;
+    /* The global dispatcher, when present, already gates on uid; otherwise the
+     * callback must do the check itself. Bit1 marks the access-class probe. */
+    uintptr_t base = syscall_hook_global_enabled() ? SU_PROBE_GATED : 0;
 
-    rc = hook_syscalln(__NR3264_fstatat, 4, su_handler_arg1_ufilename_before, 0, gated);
+    rc = hook_syscalln(__NR3264_fstatat, 4, su_handler_arg1_ufilename_before, 0,
+                       (void *)(base));
     log_boot("hook __NR3264_fstatat rc: %d\n", rc);
 
-    rc = hook_syscalln(__NR_faccessat, 3, su_handler_arg1_ufilename_before, 0, gated);
+    rc = hook_syscalln(__NR_faccessat, 3, su_handler_arg1_ufilename_before, 0,
+                       (void *)(base | SU_PROBE_ACCESS));
     log_boot("hook __NR_faccessat rc: %d\n", rc);
 
-    /* 32-bit compat probes: fstatat64(327) / faccessat(334) */
-    rc = hook_compat_syscalln(327, 4, su_handler_arg1_ufilename_before, 0, gated);
+    /* No compat registrations on ARM: see the note above. On arm64 the compat
+     * table is real, so keep them there. */
+#ifndef CONFIG_ARM
+    rc = hook_compat_syscalln(327, 4, su_handler_arg1_ufilename_before, 0, (void *)base);
     log_boot("hook 32 __NR_fstatat64 rc: %d\n", rc);
 
-    rc = hook_compat_syscalln(334, 3, su_handler_arg1_ufilename_before, 0, gated);
+    rc = hook_compat_syscalln(334, 3, su_handler_arg1_ufilename_before, 0,
+                              (void *)(base | SU_PROBE_ACCESS));
     log_boot("hook 32 __NR_faccessat rc: %d\n", rc);
+#endif
 
     su_path_probe_hooks_active = 1;
 }
