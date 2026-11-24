@@ -52,6 +52,7 @@ long kp_control_feature_sc(const char __user *uname, int state);
  * When on, a su exec from a uid outside the su whitelist is parked in an
  * interruptible wait until a trusted manager supplies a decision. */
 int su_prompt_enabled(void);
+int su_prompt_is_group(int gid);
 int su_prompt_poll(struct su_request __user *out_reqs, int max);
 int su_prompt_decision(pid_t pid, int decision);
 

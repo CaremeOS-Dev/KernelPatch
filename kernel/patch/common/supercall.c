@@ -331,6 +331,13 @@ static long supercall(int is_authed, long cmd, long arg1, long arg2, long arg3, 
     case SUPERCALL_KSTORAGE_READ:
         return call_kstorage_read((int)arg1, (long)arg2, (void *)arg3, (int)((long)arg4 >> 32), (long)arg4 << 32 >> 32);
     case SUPERCALL_KSTORAGE_WRITE:
+        /* The su-prompt group holds the pending request/decision records. It
+         * must not be writable before the auth gate above: otherwise any app
+         * can race the kernel's PENDING write with decision=ALLOW for its own
+         * pid and self-approve the prompt apd is about to wait on. The other
+         * groups stay writable so apd can keep maintaining the exclude list. */
+        if (!is_authed && su_prompt_is_group((int)arg1))
+            return -EPERM;
         return call_kstorage_write((int)arg1, (long)arg2, (void *)arg3, (int)((long)arg4 >> 32),
                                    (long)arg4 << 32 >> 32);
     case SUPERCALL_KSTORAGE_LIST_IDS:

@@ -125,37 +125,17 @@ static const struct trusted_manager_entry trusted_managers[] = {
     },
     /*
      * >>> SU PROMPT: TRUSTED MANAGER INTEGRATION POINT <<<
-     * The SU_PENDING_POLL / SU_DECISION supercalls are gated on is_authed,
+     *
+     * SUPERCALL_SU_PENDING_POLL / SUPERCALL_SU_DECISION are gated on is_authed,
      * which for a signature-authorized kernel means is_trusted_manager_uid().
-     * To let YOUR manager drive the su prompt, add its entry here:
+     * Only a manager listed HERE can arbitrate su requests, and this table is
+     * compile-time data: whatever is listed here gets root on every device that
+     * flashes this kernel.
      *
-     *   1) compute the signer certificate DER SHA-256 of your signed APK:
-     *        python3 tools/apk_cert_digest.py your-manager.apk
-     *      (or: openssl x509 -inform DER -fingerprint -sha256 < cert.der)
-     *   2) put the 32 digest bytes below and set applicationId in `package`.
-     *   3) rebuild kpimg and re-patch the kernel (this table is compile-time).
-     *
-     * The all-zero digest below matches no certificate, so leaving it in
-     * place is harmless: only the two real entries above stay trusted.
+     * The feature therefore ships with no entry of its own. A fork that wants
+     * its own manager adds its signer digest deliberately and says so in the PR
+     * (see .github/workflows/pr-guard.yml).
      */
-    {
-        "com.yourcompany.mymanager",
-        {
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-        }
-    },
-    {
-        "com.zcg.apatch",
-        {
-            0x3c, 0x7b, 0xdc, 0x84, 0x63, 0xc5, 0xde, 0xce,
-            0xe2, 0x12, 0x49, 0x3f, 0xe8, 0xb6, 0x73, 0x7c,
-            0x43, 0xcb, 0x54, 0x1a, 0xff, 0x50, 0x14, 0x26,
-            0x34, 0x9d, 0x6f, 0x1a, 0xf4, 0x0d, 0x59, 0xa6
-        }
-    },
     { "", { 0 } }
 };
 

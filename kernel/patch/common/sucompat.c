@@ -162,6 +162,14 @@ int su_prompt_enabled(void)
 {
     return __atomic_load_n(&su_prompt_on, __ATOMIC_RELAXED);
 }
+
+/* True when `gid` is the kstorage group that holds pending su requests. Used by
+ * the supercall dispatcher to keep that group write-protected for callers that
+ * are not authenticated (see SUPERCALL_KSTORAGE_WRITE). */
+int su_prompt_is_group(int gid)
+{
+    return su_prompt_kstorage_gid >= 0 && gid == su_prompt_kstorage_gid;
+}
 KP_EXPORT_SYMBOL(su_prompt_enabled);
 
 struct su_prompt_poll_ctx {
