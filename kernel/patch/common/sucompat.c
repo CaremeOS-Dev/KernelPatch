@@ -198,17 +198,17 @@ static int su_prompt_wait(pid_t pid, int *timed_out)
         if (!kf_msleep) break;
         kf_msleep(SU_PROMPT_POLL_MS);
         if (read_kstorage(su_prompt_kstorage_gid, (long)pid, &req, 0, sizeof(req), false) < 0)
-            return SU_DECISION_DENY;          /* record vanished -> deny */
-        if (req.decision == SU_DECISION_ALLOW)
-            return SU_DECISION_ALLOW;
-        if (req.decision == SU_DECISION_DENY || req.decision == SU_DECISION_TIMEOUT)
-            return SU_DECISION_DENY;
+            return SU_DECISION_DENY_ONCE;     /* record vanished -> deny, remember nothing */
+        if (req.decision == SU_DECISION_ALLOW || req.decision == SU_DECISION_ALLOW_ONCE ||
+            req.decision == SU_DECISION_DENY || req.decision == SU_DECISION_DENY_ONCE ||
+            req.decision == SU_DECISION_TIMEOUT)
+            return req.decision;
     }
     /* Nobody answered: the configured policy decides, and nothing is persisted. */
     *timed_out = 1;
     return __atomic_load_n(&su_prompt_timeout_allow, __ATOMIC_RELAXED)
-               ? SU_DECISION_ALLOW
-               : SU_DECISION_DENY;
+               ? SU_DECISION_ALLOW_ONCE
+               : SU_DECISION_DENY_ONCE;
 }
 
 /* ---- SU prompt: remembered decisions ------------------------------------- */
@@ -244,8 +244,13 @@ static void su_deny_remove(uid_t uid)
  * accumulate one entry per su forever. */
 static void su_prompt_apply(uid_t uid, pid_t pid, int decision, int timed_out)
 {
-    if (!timed_out) {
-        if (decision == SU_DECISION_ALLOW) {
+    int allow = (decision == SU_DECISION_ALLOW || decision == SU_DECISION_ALLOW_ONCE);
+    /* Only ALLOW / DENY (not the *_ONCE variants) are remembered, and a timeout
+     * is never remembered. */
+    int remember = !timed_out && (decision == SU_DECISION_ALLOW || decision == SU_DECISION_DENY);
+
+    if (remember) {
+        if (allow) {
             su_deny_remove(uid);
             su_add_allow_uid(uid, 0, all_allow_sctx);
             logkfi("su_prompt remember ALLOW uid: %d\n", uid);
@@ -255,8 +260,8 @@ static void su_prompt_apply(uid_t uid, pid_t pid, int decision, int timed_out)
             logkfi("su_prompt remember DENY uid: %d\n", uid);
         }
     } else {
-        logkfi("su_prompt timeout uid: %d -> %s (not remembered)\n", uid,
-               decision == SU_DECISION_ALLOW ? "allow" : "deny");
+        logkfi("su_prompt %s uid: %d -> %s (not remembered)\n",
+               timed_out ? "timeout" : "one-shot", uid, allow ? "allow" : "deny");
     }
     remove_kstorage(su_prompt_kstorage_gid, (long)pid);
 }
@@ -518,7 +523,7 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
             int timed_out = 0;
             int decision = su_prompt_wait(pid, &timed_out);
             su_prompt_apply(uid, pid, decision, timed_out);
-            if (decision != SU_DECISION_ALLOW) {
+            if (decision != SU_DECISION_ALLOW && decision != SU_DECISION_ALLOW_ONCE) {
                 logkfi("su_prompt denied uid: %d pid: %d -> ENOENT\n", uid, pid);
                 return;
             }
