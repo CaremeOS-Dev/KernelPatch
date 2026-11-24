@@ -1,0 +1,112 @@
+name: PR guard
+
+# Kernel-side review guard. Three things must never slip through unnoticed:
+#
+#   1. trusted_managers[] / kp_trusted_managers[] decide which APK signature may
+#      drive the supercall layer. Adding an entry hands that signer full root
+#      control of every device running this kernel, so it needs an explicit
+#      attestation in the PR body:
+#          Trusted-Manager-Added: <applicationId> <sha256 of the signer cert>
+#
+#   2. The kpimg pin in the build is the blob that was verified on hardware.
+#      A kernel change produces a different blob; the pin may only move together
+#      with an attestation of the re-verification:
+#          Blob-Verified: <compile_time-masked md5>
+#
+#   3. kernel/patch/include/uapi/scdefs.h is the ABI the manager compiles
+#      against; tools/uapi/scdefs.h must stay a byte-for-byte equivalent copy.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+env:
+  VERIFIED_BLOB_MD5: a877658041bd9b3ce19b7095cb4bc40b
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Changed files
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --quiet origin "${{ github.base_ref }}"
+          git diff --name-only "origin/${{ github.base_ref }}...HEAD" | tee changed.txt
+
+      - name: Trusted manager table is locked
+        env:
+          # Passed through the environment on purpose: interpolating the PR body
+          # with ${{ }} would let the PR author inject shell into this runner.
+          PULL_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          status=0
+          for f in kernel/patch/android/userd.c lkm/manager/apk_sign.c; do
+            git show "origin/${{ github.base_ref }}:$f" > base.c
+            grep -oP '"\K[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+' base.c | sort -u > base.pkgs
+            grep -oP '"\K[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z0-9_]+)+' "$f" | sort -u > head.pkgs
+            added=$(comm -13 base.pkgs head.pkgs || true)
+            [ -n "$added" ] || continue
+            echo "--- $f adds trusted manager(s): $added ---"
+            while read -r pkg; do
+              [ -n "$pkg" ] || continue
+              if printf '%s' "$PULL_BODY" | grep -qE "Trusted-Manager-Added:[[:space:]]*$pkg([[:space:]]|$)"; then
+                echo "attested: $pkg"
+              else
+                echo "::error::$f grants trusted-manager rights to '$pkg' without a 'Trusted-Manager-Added: $pkg <cert-sha256>' attestation in the PR body"
+                status=1
+              fi
+            done <<< "$added"
+          done
+          exit $status
+
+      - name: kpimg pin changes need a hardware attestation
+        env:
+          PULL_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          pin=$(grep -oE '\b[0-9a-f]{32}\b' .github/workflows/xtc-arm32.yml | head -1 || true)
+          echo "pin in workflow: $pin"
+          if [ "$pin" = "$VERIFIED_BLOB_MD5" ]; then
+            echo "pin unchanged (device-verified blob)"
+            exit 0
+          fi
+          if printf '%s' "$PULL_BODY" | grep -qiE "Blob-Verified:[[:space:]]*$pin"; then
+            echo "pin change attested"
+          else
+            echo "::error::the kpimg pin moved to '$pin' without a 'Blob-Verified: $pin' attestation."
+            echo "Build the blob, flash it on hardware, confirm boot + su, then attest in the PR body."
+            exit 1
+          fi
+
+      - name: uapi headers must match
+        run: |
+          set -euo pipefail
+          norm() { awk '/^#define[ \t]+(SUPERCALL|KSTORAGE)_[A-Z0-9_]+/ {print $2, $3}' "$1" | sort; }
+          norm kernel/patch/include/uapi/scdefs.h > a.txt
+          norm tools/uapi/scdefs.h > b.txt
+          if ! diff -u a.txt b.txt; then
+            echo "::error::kernel and tools copies of scdefs.h disagree; the manager would compile against a different ABI"
+            exit 1
+          fi
+          echo "uapi headers agree ($(wc -l < a.txt) defines)"
+
+      - name: supercall ids must be unique
+        run: |
+          set -euo pipefail
+          awk '/^#define[ \t]+SUPERCALL_[A-Z0-9_]+[ \t]+0x[0-9A-Fa-f]+/ {print $2, $3}' \
+              kernel/patch/include/uapi/scdefs.h | sort -k2 > ids.txt
+          dup=$(awk '{print $2}' ids.txt | sort | uniq -d)
+          if [ -n "$dup" ]; then
+            echo "::error::duplicate supercall id(s): $dup"
+            grep -E " ($dup)$" ids.txt
+            exit 1
+          fi
+          echo "$(wc -l < ids.txt) unique supercall ids"
