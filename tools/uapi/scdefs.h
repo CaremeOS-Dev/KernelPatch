@@ -150,6 +150,13 @@ struct su_profile
 
 #define SU_REQ_COMM_LEN 16
 
+/* How long the kernel holds an execve() waiting for the manager's answer, and
+ * how often it re-reads the pending record. Bounded on purpose: if the manager
+ * is not running the call fails according to the configured timeout policy
+ * (control_feature("su_prompt_timeout"): 0 = deny, 1 = allow). */
+#define SU_PROMPT_TIMEOUT_MS 10000
+#define SU_PROMPT_POLL_MS       50
+
 /*
  * One pending su request. Stored in kstorage group KSTORAGE_UNUSED_GROUP_2,
  * keyed by the requesting process tgid so concurrent requests do not collide.

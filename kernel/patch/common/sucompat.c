@@ -57,10 +57,15 @@ static int su_kstorage_gid = -1;
 static int exclude_kstorage_gid = -1;
 static int su_prompt_kstorage_gid = -1;
 static volatile int su_prompt_on = 0;   /* off by default; toggled via control_feature("su_prompt") */
-/* KernelPatch is freestanding: no sleep/wait primitives. The kernel only
- * records a pending request in kstorage (group 2, key=pid) and still elevates
- * + execs apd as usual. The blocking "wait for user tap" runs in apd (userspace).
- */
+/* What to do when the manager does not answer within SU_PROMPT_TIMEOUT_MS:
+ * 0 = deny (default), 1 = allow. Toggled via control_feature("su_prompt_timeout"). */
+static volatile int su_prompt_timeout_allow = 0;
+
+/* kfunc_def(msleep) declares the resolved-symbol pointer kf_msleep in
+ * patch/ksyms/misc.c. This tree ships no linux/delay.h, so declare it here.
+ * When the kernel did not export it (kallsyms miss) the pointer stays NULL and
+ * we fall back to the asynchronous path below instead of calling through NULL. */
+extern void kfunc_def(msleep)(unsigned int msecs);
 /* 1 while su_register_path_probe_hooks() has the fstatat/faccessat probes
  * installed.  Stays 0 under the AArch32 safety gate so the unregister path
  * never unwraps a hook that was never installed. */
@@ -86,6 +91,14 @@ long kp_control_feature_sc(const char __user *uname, int state)
             logkfi("su_prompt %s\n", state ? "enabled" : "disabled");
         }
         return __atomic_load_n(&su_prompt_on, __ATOMIC_RELAXED);
+    }
+
+    if (!strcmp(name, "su_prompt_timeout")) {
+        if (state >= 0) {
+            __atomic_store_n(&su_prompt_timeout_allow, state ? 1 : 0, __ATOMIC_RELAXED);
+            logkfi("su_prompt timeout -> %s\n", state ? "allow" : "deny");
+        }
+        return __atomic_load_n(&su_prompt_timeout_allow, __ATOMIC_RELAXED);
     }
 
     if (!strcmp(name, "sucompat_extra") || !strcmp(name, "path_probe")) {
@@ -161,6 +174,45 @@ KP_EXPORT_SYMBOL(is_su_allow_uid);
 int su_prompt_enabled(void)
 {
     return __atomic_load_n(&su_prompt_on, __ATOMIC_RELAXED);
+}
+
+/* True when the payload can hold an execve() in the kernel. Sleeping inside the
+ * execve hook is legal (process context, no locks held), but only if msleep
+ * actually resolved -- otherwise the asynchronous path is used. */
+int su_prompt_can_wait(void)
+{
+    return kf_msleep != 0;
+}
+
+/* Bounded wait for the manager's answer. On timeout the configured policy
+ * decides: allow or deny. The outcome is written back into the record so apd,
+ * which re-reads it, sees the same decision instead of waiting again. */
+static int su_prompt_wait(pid_t pid)
+{
+    struct su_request req;
+    for (int waited = 0; waited < SU_PROMPT_TIMEOUT_MS; waited += SU_PROMPT_POLL_MS) {
+        if (!kf_msleep) return SU_DECISION_TIMEOUT;
+        kf_msleep(SU_PROMPT_POLL_MS);
+        if (read_kstorage(su_prompt_kstorage_gid, (long)pid, &req, 0, sizeof(req), false) < 0)
+            return SU_DECISION_DENY;          /* record vanished -> deny */
+        if (req.decision == SU_DECISION_ALLOW)
+            return SU_DECISION_ALLOW;
+        if (req.decision == SU_DECISION_DENY || req.decision == SU_DECISION_TIMEOUT)
+            return SU_DECISION_DENY;
+    }
+    return __atomic_load_n(&su_prompt_timeout_allow, __ATOMIC_RELAXED)
+               ? SU_DECISION_ALLOW
+               : SU_DECISION_TIMEOUT;
+}
+
+/* Persist the kernel's own decision into the pending record. */
+static void su_prompt_store_decision(pid_t pid, int decision)
+{
+    struct su_request rec;
+    if (read_kstorage(su_prompt_kstorage_gid, (long)pid, &rec, 0, sizeof(rec), false) < 0)
+        return;
+    rec.decision = (decision == SU_DECISION_ALLOW) ? SU_DECISION_ALLOW : SU_DECISION_DENY;
+    write_kstorage(su_prompt_kstorage_gid, (long)pid, &rec, 0, sizeof(rec), false);
 }
 
 /* True when `gid` is the kstorage group that holds pending su requests. Used by
@@ -352,7 +404,26 @@ const char *su_get_path()
 }
 KP_EXPORT_SYMBOL(su_get_path);
 
-static void handle_before_execve(char **__user u_filename_p, char **__user uargv, void *udata)
+/* Common prefix of every hook_fargsN_t: chain, skip_origin, local, ret.
+ * before_execve() (execve, 3 args) and before_execveat() (5 args) hand us
+ * different concrete fargs types, but this part of the layout is identical, so
+ * one helper can set the syscall's return value for both. */
+typedef struct
+{
+    void *chain;
+    int skip_origin;
+    void *local[2];
+    uint64_t ret;
+} su_hook_head_t;
+
+static inline void su_hook_return_enoent(void *fargs)
+{
+    su_hook_head_t *h = (su_hook_head_t *)fargs;
+    h->skip_origin = 1;
+    h->ret = (uint64_t)(long)-ENOENT;
+}
+
+static void handle_before_execve(void *fargs, char **__user u_filename_p, char **__user uargv, void *udata)
 {
     uid_t uid = current_uid();
     int trusted = is_trusted_manager_uid(uid);
@@ -402,9 +473,29 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
         long wrc = write_kstorage(su_prompt_kstorage_gid, (long)pid, &req, 0, sizeof(req), false);
         if (wrc < 0) return;
 
-        logkfi("su_prompt pending uid: %d, pid: %d (apd will arbitrate)\n", uid, pid);
-        /* Do NOT sleep: elevate + exec apd as usual, and let apd block in
-         * userspace until the manager writes ALLOW/DENY into this kstorage. */
+        logkfi("su_prompt pending uid: %d, pid: %d\n", uid, pid);
+
+        /* Synchronous arbitration: hold the syscall in the kernel (bounded by
+         * SU_PROMPT_TIMEOUT_MS) and let the manager's answer decide it.
+         *
+         * This is the only way to deny with -ENOENT: redirecting into apd first
+         * has already replaced the caller's image, so a later refusal can only
+         * be an exit status, never "no such file". If msleep did not resolve
+         * (kallsyms miss) fall through to the asynchronous apd-side wait. */
+        if (su_prompt_can_wait()) {
+            int decision = su_prompt_wait(pid);
+            su_prompt_store_decision(pid, decision);
+            if (decision != SU_DECISION_ALLOW) {
+                logkfi("su_prompt denied uid: %d pid: %d -> ENOENT\n", uid, pid);
+                su_hook_return_enoent(fargs);
+                return;
+            }
+            logkfi("su_prompt allowed uid: %d pid: %d\n", uid, pid);
+        } else {
+            logkfi("su_prompt async (msleep unresolved), apd will arbitrate\n");
+        }
+
+        /* Allowed (or asynchronous fallback): elevate + exec apd as usual. */
         strncpy(profile.scontext, all_allow_sctx, sizeof(profile.scontext) - 1);
         profile.scontext[sizeof(profile.scontext) - 1] = '\0';
         goto commit_and_redirect;
@@ -485,7 +576,7 @@ static void before_execve(hook_fargs3_t *args, void *udata)
 {
     void *arg0p = syscall_argn_p(args, 0);
     void *arg1p = syscall_argn_p(args, 1);
-    handle_before_execve((char **)arg0p, (char **)arg1p, udata);
+    handle_before_execve(args, (char **)arg0p, (char **)arg1p, udata);
 }
 
 // https://elixir.bootlin.com/linux/v6.1/source/fs/exec.c#L2114
@@ -502,7 +593,7 @@ __maybe_unused static void before_execveat(hook_fargs5_t *args, void *udata)
 {
     void *arg1p = syscall_argn_p(args, 1);
     void *arg2p = syscall_argn_p(args, 2);
-    handle_before_execve((char **)arg1p, (char **)arg2p, udata);
+    handle_before_execve(args, (char **)arg1p, (char **)arg2p, udata);
 }
 
 // https://elixir.bootlin.com/linux/v6.1/source/fs/stat.c#L431
