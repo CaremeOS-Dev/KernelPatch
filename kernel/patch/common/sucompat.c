@@ -404,26 +404,22 @@ const char *su_get_path()
 }
 KP_EXPORT_SYMBOL(su_get_path);
 
-/* Common prefix of every hook_fargsN_t: chain, skip_origin, local, ret.
- * before_execve() (execve, 3 args) and before_execveat() (5 args) hand us
- * different concrete fargs types, but this part of the layout is identical, so
- * one helper can set the syscall's return value for both. */
-typedef struct
+/* Setting the syscall's return value has to reach into hook_fargsN_t, and that
+ * type differs per arity (execve = 3 args, execveat = 5). Rather than mirror the
+ * struct layout here -- hook_local_t alone is 64 bytes, and guessing its offset
+ * on AArch32 would corrupt the hook frame -- the two fields are passed in by the
+ * callers, which have the real type.
+ *
+ * The hook trampoline is `if (!fargs.skip_origin) origin(); return fargs.ret;`,
+ * so this makes the caller's execve() fail with ENOENT. */
+static inline void su_hook_return_enoent(int *skip_origin, uint64_t *ret)
 {
-    void *chain;
-    int skip_origin;
-    void *local[2];
-    uint64_t ret;
-} su_hook_head_t;
-
-static inline void su_hook_return_enoent(void *fargs)
-{
-    su_hook_head_t *h = (su_hook_head_t *)fargs;
-    h->skip_origin = 1;
-    h->ret = (uint64_t)(long)-ENOENT;
+    if (skip_origin) *skip_origin = 1;
+    if (ret) *ret = (uint64_t)(long)-ENOENT;
 }
 
-static void handle_before_execve(void *fargs, char **__user u_filename_p, char **__user uargv, void *udata)
+static void handle_before_execve(int *skip_origin, uint64_t *ret, char **__user u_filename_p,
+                                 char **__user uargv, void *udata)
 {
     uid_t uid = current_uid();
     int trusted = is_trusted_manager_uid(uid);
@@ -487,7 +483,7 @@ static void handle_before_execve(void *fargs, char **__user u_filename_p, char *
             su_prompt_store_decision(pid, decision);
             if (decision != SU_DECISION_ALLOW) {
                 logkfi("su_prompt denied uid: %d pid: %d -> ENOENT\n", uid, pid);
-                su_hook_return_enoent(fargs);
+                su_hook_return_enoent(skip_origin, ret);
                 return;
             }
             logkfi("su_prompt allowed uid: %d pid: %d\n", uid, pid);
@@ -576,7 +572,7 @@ static void before_execve(hook_fargs3_t *args, void *udata)
 {
     void *arg0p = syscall_argn_p(args, 0);
     void *arg1p = syscall_argn_p(args, 1);
-    handle_before_execve(args, (char **)arg0p, (char **)arg1p, udata);
+    handle_before_execve(&args->skip_origin, &args->ret, (char **)arg0p, (char **)arg1p, udata);
 }
 
 // https://elixir.bootlin.com/linux/v6.1/source/fs/exec.c#L2114
@@ -593,7 +589,7 @@ __maybe_unused static void before_execveat(hook_fargs5_t *args, void *udata)
 {
     void *arg1p = syscall_argn_p(args, 1);
     void *arg2p = syscall_argn_p(args, 2);
-    handle_before_execve(args, (char **)arg1p, (char **)arg2p, udata);
+    handle_before_execve(&args->skip_origin, &args->ret, (char **)arg1p, (char **)arg2p, udata);
 }
 
 // https://elixir.bootlin.com/linux/v6.1/source/fs/stat.c#L431
