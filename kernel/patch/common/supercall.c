@@ -272,6 +272,17 @@ static long call_kstorage_remove(int gid, long did)
     return remove_kstorage(gid, did);
 }
 
+/* ---- SU prompt: manager-facing poll / decision ---------------------------- */
+static long call_su_prompt_poll(struct su_request __user *out_reqs, int max)
+{
+    return su_prompt_poll(out_reqs, max);
+}
+
+static long call_su_prompt_decision(pid_t pid, int decision)
+{
+    return su_prompt_decision(pid, decision);
+}
+
 static long supercall(int is_authed, long cmd, long arg1, long arg2, long arg3, long arg4)
 {
     switch (cmd) {
@@ -320,6 +331,13 @@ static long supercall(int is_authed, long cmd, long arg1, long arg2, long arg3, 
     case SUPERCALL_KSTORAGE_READ:
         return call_kstorage_read((int)arg1, (long)arg2, (void *)arg3, (int)((long)arg4 >> 32), (long)arg4 << 32 >> 32);
     case SUPERCALL_KSTORAGE_WRITE:
+        /* The su-prompt group holds the pending request/decision records. It
+         * must not be writable before the auth gate above: otherwise any app
+         * can race the kernel's PENDING write with decision=ALLOW for its own
+         * pid and self-approve the prompt apd is about to wait on. The other
+         * groups stay writable so apd can keep maintaining the exclude list. */
+        if (!is_authed && su_prompt_is_group((int)arg1))
+            return -EPERM;
         return call_kstorage_write((int)arg1, (long)arg2, (void *)arg3, (int)((long)arg4 >> 32),
                                    (long)arg4 << 32 >> 32);
     case SUPERCALL_KSTORAGE_LIST_IDS:
@@ -359,6 +377,12 @@ static long supercall(int is_authed, long cmd, long arg1, long arg2, long arg3, 
     case SUPERCALL_SKEY_ROOT_ENABLE:
         return call_skey_root_enable((int)arg1);
         break;
+    /* Placed AFTER `if (!is_authed)`, so an app that is merely in the su
+     * whitelist cannot forge an ALLOW for its own pending request. */
+    case SUPERCALL_SU_PENDING_POLL:
+        return call_su_prompt_poll((struct su_request __user *)arg1, (int)arg2);
+    case SUPERCALL_SU_DECISION:
+        return call_su_prompt_decision((pid_t)arg1, (int)arg2);
     }
 
     switch (cmd) {

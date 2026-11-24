@@ -123,6 +123,32 @@ static const struct trusted_manager_entry trusted_managers[] = {
             0xa1, 0x00, 0xdd, 0x87, 0xba, 0x64, 0x0b, 0xc7
         }
     },
+    /*
+     * >>> SU PROMPT: TRUSTED MANAGER INTEGRATION POINT <<<
+     *
+     * SUPERCALL_SU_PENDING_POLL / SUPERCALL_SU_DECISION are gated on is_authed,
+     * which for a signature-authorized kernel means is_trusted_manager_uid().
+     * Only a manager listed HERE can arbitrate su requests, and this table is
+     * compile-time data: whatever is listed here gets root on every device that
+     * flashes this kernel.
+     *
+     * The entry below is ZCG's manager (XTC community, cooperating with
+     * CaremeOS-Dev on this port). It is a deliberate decision, recorded here so
+     * that nobody has to guess why an external signer is trusted:
+     *   package : com.zcg.apatch
+     *   signer  : sha256 3c7bdc8463c5decee212493fe8b6737c43cb541aff50142634 9d6f1af40d59a6
+     * Any further entry needs the same justification and a
+     * `Trusted-Manager-Added:` attestation in the PR (pr-guard enforces it).
+     */
+    {
+        "com.zcg.apatch",
+        {
+            0x3c, 0x7b, 0xdc, 0x84, 0x63, 0xc5, 0xde, 0xce,
+            0xe2, 0x12, 0x49, 0x3f, 0xe8, 0xb6, 0x73, 0x7c,
+            0x43, 0xcb, 0x54, 0x1a, 0xff, 0x50, 0x14, 0x26,
+            0x34, 0x9d, 0x6f, 0x1a, 0xf4, 0x0d, 0x59, 0xa6
+        }
+    },
     { "", { 0 } }
 };
 

@@ -79,10 +79,15 @@ jobs:
             exit 0
           fi
           if printf '%s' "$PULL_BODY" | grep -qiE "Blob-Verified:[[:space:]]*$pin"; then
-            echo "pin change attested"
+            echo "pin change attested (flashed and verified on hardware)"
+          elif printf '%s' "$PULL_BODY" | grep -qiE "Blob-Approved:[[:space:]]*$pin[[:space:]]+\S"; then
+            # Pre-release escape hatch: the maintainer accepts a blob he has not
+            # flashed yet, and says why. Greppable forever in the PR.
+            echo "pin change approved without a hardware test (pre-release)"
           else
-            echo "::error::the kpimg pin moved to '$pin' without a 'Blob-Verified: $pin' attestation."
-            echo "Build the blob, flash it on hardware, confirm boot + su, then attest in the PR body."
+            echo "::error::the kpimg pin moved to '$pin' without an attestation."
+            echo "Either 'Blob-Verified: $pin' (flashed, boot + su confirmed) or"
+            echo "'Blob-Approved: $pin <reason>' (maintainer accepts an untested blob on purpose)."
             exit 1
           fi
 
