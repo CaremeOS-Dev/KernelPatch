@@ -149,6 +149,21 @@ static const struct trusted_manager_entry trusted_managers[] = {
             0x34, 0x9d, 0x6f, 0x1a, 0xf4, 0x0d, 0x59, 0xa6
         }
     },
+    /*
+     * CaremeOS-Dev release key -- the signer of the builds this repo publishes
+     * (CN=XTC APatch). Same package as above: the manager keeps one identity, but
+     * either signer is accepted, so a locally rebuilt/self-signed APK still
+     * authenticates while the official one keeps working.
+     */
+    {
+        "com.zcg.apatch",
+        {
+            0xa4, 0xfd, 0xa3, 0xcd, 0x08, 0xb4, 0xa8, 0x88,
+            0xcd, 0xd5, 0x41, 0x0a, 0x3a, 0xfa, 0x58, 0xb6,
+            0xc5, 0x3c, 0xdd, 0xb5, 0x4d, 0xbc, 0xd4, 0x1c,
+            0xf7, 0x2c, 0xae, 0x21, 0x4c, 0x11, 0x5f, 0x89
+        }
+    },
     { "", { 0 } }
 };
 

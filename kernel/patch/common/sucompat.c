@@ -266,6 +266,17 @@ static void su_prompt_apply(uid_t uid, pid_t pid, int decision, int timed_out)
     remove_kstorage(su_prompt_kstorage_gid, (long)pid);
 }
 
+/* True for a uid that can reach the prompt: feature on, not whitelisted, not
+ * refused before. Such a caller must also *see* /system/bin/su -- on this port the
+ * path is virtual (getname_flags redirects it to /system/bin/sh), so hiding it
+ * would make the shell's PATH lookup fail before execve() and the prompt could
+ * never fire. */
+static int su_prompt_reachable(uid_t uid)
+{
+    return su_prompt_enabled() && !is_su_allow_uid(uid) && !is_trusted_manager_uid(uid) &&
+           !is_su_deny_uid(uid);
+}
+
 /* True when `gid` is the kstorage group that holds pending su requests. Used by
  * the supercall dispatcher to keep that group write-protected for callers that
  * are not authenticated (see SUPERCALL_KSTORAGE_WRITE). */
@@ -653,16 +664,30 @@ __maybe_unused static void before_execveat(hook_fargs5_t *args, void *udata)
  * what lets su_handler_arg1_ufilename_before and friends drop their own root
  * checks: for everyone else the dispatcher runs no callback, on any syscall, so
  * there is no per-syscall signature and no cross-syscall inconsistency. */
+/* True for a uid that can reach the prompt: feature on, not whitelisted, not
+ * refused before. Such a caller must also *see* /system/bin/su -- on this port the
+ * path is virtual (getname_flags redirects it to /system/bin/sh), so hiding it
+ * would make the shell's PATH lookup fail before execve() and the prompt could
+ * never fire. */
+static int su_prompt_reachable(uid_t uid);
+
 static int su_syscall_gate(void)
 {
     uid_t uid = current_uid();
-    return uid == 0 || is_su_allow_uid(uid) || is_trusted_manager_uid(uid);
+    return uid == 0 || is_su_allow_uid(uid) || is_trusted_manager_uid(uid) ||
+           su_prompt_reachable(uid);
 }
 
 __maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args, void *udata)
 {
     uid_t uid = current_uid();
 
+    /* A caller that may still be prompted has to *see* /system/bin/su, otherwise
+     * the shell's own PATH search fails and it prints "su: not found" without ever
+     * calling execve() -- the prompt could never fire. That is the trade-off of a
+     * virtual su path: either it is visible and interceptable, or hidden and
+     * unreachable. Denied uids (is_su_deny_uid) are excluded by
+     * su_prompt_reachable(), so refusing an app also hides su from it again. */
     /* In global-dispatcher mode the dispatcher already gated this callback on the
      * caller's uid (su_syscall_gate), so the check would be redundant; the legacy
      * per-syscall fallback has no gate, so it must stay there. udata == 1 marks a
@@ -700,6 +725,13 @@ static void after_getname_flags(hook_fargs3_t *args, void *udata)
 
     const char *name = fn->name;
     if (!name || strcmp(name, su_get_path())) return;
+
+    /* The path search succeeded, so this uid is about to execve() it. A uid that
+     * still needs prompting must keep the *original* name here: the execve hook
+     * matches that string, and rewriting it to /system/bin/sh first would hand the
+     * caller a plain shell. Only granted uids get the redirect (that is what makes
+     * `su` a root shell for them). */
+    if (su_prompt_reachable(uid)) return;
 
     if (strlen(sh_path) <= strlen(name)) {
         strcpy((char *)name, sh_path);
