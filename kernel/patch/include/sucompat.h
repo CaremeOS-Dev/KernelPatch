@@ -53,6 +53,9 @@ long kp_control_feature_sc(const char __user *uname, int state);
  * interruptible wait until a trusted manager supplies a decision. */
 int su_prompt_enabled(void);
 int su_prompt_is_group(int gid);
+/* True when the uid was explicitly refused and remembered: su fails like a
+ * missing binary, no prompt is shown again. The list is kstorage group 3. */
+int is_su_deny_uid(uid_t uid);
 int su_prompt_poll(struct su_request __user *out_reqs, int max);
 int su_prompt_decision(pid_t pid, int decision);
 

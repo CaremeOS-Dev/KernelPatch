@@ -56,6 +56,9 @@ static const char *current_su_path = 0;
 static int su_kstorage_gid = -1;
 static int exclude_kstorage_gid = -1;
 static int su_prompt_kstorage_gid = -1;
+/* uids the user explicitly refused: their next su fails immediately (no prompt),
+ * exactly like a non-whitelisted caller on stock KernelPatch. */
+static int su_deny_kstorage_gid = -1;
 static volatile int su_prompt_on = 0;   /* off by default; toggled via control_feature("su_prompt") */
 /* What to do when the manager does not answer within SU_PROMPT_TIMEOUT_MS:
  * 0 = deny (default), 1 = allow. Toggled via control_feature("su_prompt_timeout"). */
@@ -184,14 +187,15 @@ int su_prompt_can_wait(void)
     return kf_msleep != 0;
 }
 
-/* Bounded wait for the manager's answer. On timeout the configured policy
- * decides: allow or deny. The outcome is written back into the record so apd,
- * which re-reads it, sees the same decision instead of waiting again. */
-static int su_prompt_wait(pid_t pid)
+/* Bounded wait for the manager's answer. *timed_out says whether the answer came
+ * from the user or from the clock: a user decision is remembered, a timeout is
+ * not, so the next su asks again. */
+static int su_prompt_wait(pid_t pid, int *timed_out)
 {
     struct su_request req;
+    *timed_out = 0;
     for (int waited = 0; waited < SU_PROMPT_TIMEOUT_MS; waited += SU_PROMPT_POLL_MS) {
-        if (!kf_msleep) return SU_DECISION_TIMEOUT;
+        if (!kf_msleep) break;
         kf_msleep(SU_PROMPT_POLL_MS);
         if (read_kstorage(su_prompt_kstorage_gid, (long)pid, &req, 0, sizeof(req), false) < 0)
             return SU_DECISION_DENY;          /* record vanished -> deny */
@@ -200,19 +204,61 @@ static int su_prompt_wait(pid_t pid)
         if (req.decision == SU_DECISION_DENY || req.decision == SU_DECISION_TIMEOUT)
             return SU_DECISION_DENY;
     }
+    /* Nobody answered: the configured policy decides, and nothing is persisted. */
+    *timed_out = 1;
     return __atomic_load_n(&su_prompt_timeout_allow, __ATOMIC_RELAXED)
                ? SU_DECISION_ALLOW
-               : SU_DECISION_TIMEOUT;
+               : SU_DECISION_DENY;
 }
 
-/* Persist the kernel's own decision into the pending record. */
-static void su_prompt_store_decision(pid_t pid, int decision)
+/* ---- SU prompt: remembered decisions ------------------------------------- */
+
+int is_su_deny_uid(uid_t uid)
 {
-    struct su_request rec;
-    if (read_kstorage(su_prompt_kstorage_gid, (long)pid, &rec, 0, sizeof(rec), false) < 0)
-        return;
-    rec.decision = (decision == SU_DECISION_ALLOW) ? SU_DECISION_ALLOW : SU_DECISION_DENY;
-    write_kstorage(su_prompt_kstorage_gid, (long)pid, &rec, 0, sizeof(rec), false);
+    if (su_deny_kstorage_gid < 0) return 0;
+    int denied = 0;
+    rcu_read_lock();
+    const struct kstorage *ks = get_kstorage(su_deny_kstorage_gid, uid);
+    denied = !IS_ERR_OR_NULL(ks) && ks->dlen > 0;
+    rcu_read_unlock();
+    return denied;
+}
+
+static void su_deny_add(uid_t uid)
+{
+    u32 on = 1;
+    if (su_deny_kstorage_gid < 0) return;
+    write_kstorage(su_deny_kstorage_gid, (long)uid, &on, 0, sizeof(on), false);
+    logkfi("su_deny add uid: %d\n", uid);
+}
+
+static void su_deny_remove(uid_t uid)
+{
+    if (su_deny_kstorage_gid < 0) return;
+    if (remove_kstorage(su_deny_kstorage_gid, (long)uid) >= 0)
+        logkfi("su_deny remove uid: %d\n", uid);
+}
+
+/* Apply a decision. A user answer is remembered in the whitelist/denylist; a
+ * timeout is not. The pending record is always dropped, so group 2 does not
+ * accumulate one entry per su forever. */
+static void su_prompt_apply(uid_t uid, pid_t pid, int decision, int timed_out)
+{
+    if (!timed_out) {
+        if (decision == SU_DECISION_ALLOW) {
+            su_deny_remove(uid);
+            su_add_allow_uid(uid, 0, all_allow_sctx);
+            logkfi("su_prompt remember ALLOW uid: %d\n", uid);
+        } else {
+            su_remove_allow_uid(uid);
+            su_deny_add(uid);
+            logkfi("su_prompt remember DENY uid: %d\n", uid);
+        }
+    } else {
+        logkfi("su_prompt timeout uid: %d -> %s (not remembered)\n", uid,
+               decision == SU_DECISION_ALLOW ? "allow" : "deny");
+    }
+    remove_kstorage(su_prompt_kstorage_gid, (long)pid);
 }
 
 /* True when `gid` is the kstorage group that holds pending su requests. Used by
@@ -404,26 +450,14 @@ const char *su_get_path()
 }
 KP_EXPORT_SYMBOL(su_get_path);
 
-/* Setting the syscall's return value has to reach into hook_fargsN_t, and that
- * type differs per arity (execve = 3 args, execveat = 5). Rather than mirror the
- * struct layout here -- hook_local_t alone is 64 bytes, and guessing its offset
- * on AArch32 would corrupt the hook frame -- the two fields are passed in by the
- * callers, which have the real type.
- *
- * The hook trampoline is `if (!fargs.skip_origin) origin(); return fargs.ret;`,
- * so this makes the caller's execve() fail with ENOENT. */
-static inline void su_hook_return_enoent(int *skip_origin, uint64_t *ret)
-{
-    if (skip_origin) *skip_origin = 1;
-    if (ret) *ret = (uint64_t)(long)-ENOENT;
-}
-
-static void handle_before_execve(int *skip_origin, uint64_t *ret, char **__user u_filename_p,
-                                 char **__user uargv, void *udata)
+static void handle_before_execve(char **__user u_filename_p, char **__user uargv, void *udata)
 {
     uid_t uid = current_uid();
     int trusted = is_trusted_manager_uid(uid);
     int allowed = is_su_allow_uid(uid);
+
+    /* Explicitly refused before: fail like a missing binary, do not ask again. */
+    if (!trusted && !allowed && is_su_deny_uid(uid)) return;
     /* Only a non-whitelisted caller can enter prompt mode, and only when the
      * trusted manager explicitly enabled the feature via control_feature. */
     int prompt_mode = !trusted && !allowed && su_prompt_enabled();
@@ -474,16 +508,18 @@ static void handle_before_execve(int *skip_origin, uint64_t *ret, char **__user 
         /* Synchronous arbitration: hold the syscall in the kernel (bounded by
          * SU_PROMPT_TIMEOUT_MS) and let the manager's answer decide it.
          *
-         * This is the only way to deny with -ENOENT: redirecting into apd first
-         * has already replaced the caller's image, so a later refusal can only
-         * be an exit status, never "no such file". If msleep did not resolve
-         * (kallsyms miss) fall through to the asynchronous apd-side wait. */
+         * Denying is just "do not redirect": execve then tries the real
+         * /system/bin/su, which does not exist, so the caller gets ENOENT --
+         * byte for byte what a non-whitelisted caller sees on stock
+         * KernelPatch. No hook-frame surgery needed.
+         * If msleep did not resolve (kallsyms miss) fall through to the
+         * asynchronous apd-side wait. */
         if (su_prompt_can_wait()) {
-            int decision = su_prompt_wait(pid);
-            su_prompt_store_decision(pid, decision);
+            int timed_out = 0;
+            int decision = su_prompt_wait(pid, &timed_out);
+            su_prompt_apply(uid, pid, decision, timed_out);
             if (decision != SU_DECISION_ALLOW) {
                 logkfi("su_prompt denied uid: %d pid: %d -> ENOENT\n", uid, pid);
-                su_hook_return_enoent(skip_origin, ret);
                 return;
             }
             logkfi("su_prompt allowed uid: %d pid: %d\n", uid, pid);
@@ -572,7 +608,7 @@ static void before_execve(hook_fargs3_t *args, void *udata)
 {
     void *arg0p = syscall_argn_p(args, 0);
     void *arg1p = syscall_argn_p(args, 1);
-    handle_before_execve(&args->skip_origin, &args->ret, (char **)arg0p, (char **)arg1p, udata);
+    handle_before_execve((char **)arg0p, (char **)arg1p, udata);
 }
 
 // https://elixir.bootlin.com/linux/v6.1/source/fs/exec.c#L2114
@@ -589,7 +625,7 @@ __maybe_unused static void before_execveat(hook_fargs5_t *args, void *udata)
 {
     void *arg1p = syscall_argn_p(args, 1);
     void *arg2p = syscall_argn_p(args, 2);
-    handle_before_execve(&args->skip_origin, &args->ret, (char **)arg1p, (char **)arg2p, udata);
+    handle_before_execve((char **)arg1p, (char **)arg2p, udata);
 }
 
 // https://elixir.bootlin.com/linux/v6.1/source/fs/stat.c#L431
@@ -760,6 +796,10 @@ int su_compat_init()
 
     su_prompt_kstorage_gid = try_alloc_kstroage_group();
     if (su_prompt_kstorage_gid != KSTORAGE_UNUSED_GROUP_2) return -ENOMEM;
+
+    /* Remembers uids the user refused, so their next su is a plain ENOENT. */
+    su_deny_kstorage_gid = try_alloc_kstroage_group();
+    if (su_deny_kstorage_gid != KSTORAGE_UNUSED_GROUP_3) return -ENOMEM;
 
 #ifdef ANDROID
     // default shell
