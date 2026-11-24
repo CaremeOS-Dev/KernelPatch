@@ -44,6 +44,9 @@
 
 const char sh_path[] = SH_PATH;
 const char default_su_path[] = SU_PATH;
+/* Where a refused su is pointed at, so execve fails with ENOENT instead of the
+ * getname_flags rewrite turning it into /system/bin/sh. Must never exist. */
+static const char denied_su_path[] = "/system/bin/.su-refused-by-kpatch";
 
 #ifdef ANDROID
 const char legacy_su_path[] = LEGACY_SU_PATH;
@@ -535,6 +538,12 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
             int decision = su_prompt_wait(pid, &timed_out);
             su_prompt_apply(uid, pid, decision, timed_out);
             if (decision != SU_DECISION_ALLOW && decision != SU_DECISION_ALLOW_ONCE) {
+                /* Deny by pointing the exec at a path that cannot exist. Simply
+                 * dropping the redirect is not enough once su is visible to this
+                 * uid: after_getname_flags would rewrite /system/bin/su to
+                 * /system/bin/sh and hand the caller a plain shell. */
+                char __user *uptr = copy_to_user_stack(denied_su_path, sizeof(denied_su_path));
+                if (uptr && !IS_ERR(uptr)) *u_filename_p = uptr;
                 logkfi("su_prompt denied uid: %d pid: %d -> ENOENT\n", uid, pid);
                 return;
             }
@@ -721,17 +730,15 @@ static void after_getname_flags(hook_fargs3_t *args, void *udata)
     if (IS_ERR_OR_NULL(fn)) return;
 
     uid_t uid = current_uid();
-    if (!is_su_allow_uid(uid) && !is_trusted_manager_uid(uid)) return;
+    /* Granted uids get a root shell; prompt-eligible uids must merely *find* the
+     * path so their shell's PATH search succeeds and execve() is reached -- the
+     * exec hook decides what actually happens, and on deny it points the exec at
+     * denied_su_path so this rewrite cannot hand out a shell. */
+    if (!is_su_allow_uid(uid) && !is_trusted_manager_uid(uid) && !su_prompt_reachable(uid))
+        return;
 
     const char *name = fn->name;
     if (!name || strcmp(name, su_get_path())) return;
-
-    /* The path search succeeded, so this uid is about to execve() it. A uid that
-     * still needs prompting must keep the *original* name here: the execve hook
-     * matches that string, and rewriting it to /system/bin/sh first would hand the
-     * caller a plain shell. Only granted uids get the redirect (that is what makes
-     * `su` a root shell for them). */
-    if (su_prompt_reachable(uid)) return;
 
     if (strlen(sh_path) <= strlen(name)) {
         strcpy((char *)name, sh_path);
