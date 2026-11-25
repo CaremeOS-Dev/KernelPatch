@@ -18,7 +18,7 @@
 static int su_comm_is_path_probe(const char *comm)
 {
     static const char *const names[] = {
-        "which", "type", "command", "whereis", NULL,
+        "which", "type", "command", "whereis", "toybox", NULL,
     };
 
     if (!comm) return 0;
@@ -76,6 +76,10 @@ int main(void)
     expect("su         (sh)", probe_hides("/system/bin/kp", 10099, 0, 1, "sh"), 0);
     expect("su         (mksh)", probe_hides("/system/bin/kp", 10099, 0, 1, "mksh"), 0);
     expect("su         (busybox)", probe_hides("/system/bin/kp", 10099, 0, 1, "busybox"), 0);
+
+    /* toybox provides `which` on the target ROM; both spellings must hide. */
+    expect("toybox which su (untrusted)", probe_hides("/system/bin/kp", 10099, 0, 1, "toybox"), 1);
+    expect("toybox which sh", probe_hides("/system/bin/sh", 10099, 0, 1, "toybox"), 0);
 
     /* Feature off: behave exactly like stock. */
     expect("which su   (prompt off)", probe_hides("/system/bin/kp", 10099, 0, 0, "which"), 0);

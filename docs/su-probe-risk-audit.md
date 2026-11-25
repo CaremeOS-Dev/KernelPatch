@@ -21,7 +21,12 @@
 
 ### B. 误伤正常命令
 - **路径**：`comm` 前缀匹配过宽（如把 `sh`、`busybox` 列进去），导致 shell 解析不到 su 或 busybox 全线异常
-- **封堵**：名单只含 `which`/`type`/`command`/`whereis`；按 `strlen(name)` 精确前缀比较；`sh`/`mkash`/`busybox` 明确不列入（代码注释写明原因）
+- **封堵**：名单为 `which`/`type`/`command`/`whereis`/`toybox`；按 `strlen(name)` 精确前缀比较；`sh`/`mksh`/`busybox` 明确不列入（代码注释写明原因）
+
+### B2. 探针抓不到真正的 `which`（实机教训）
+- **路径**：目标 ROM 上 `which` 是 **toybox applet**，linker 报告的实际二进制是 `/system/bin/toybox`；comm 可能是 `toybox` 而不是 `which`，探针就会静默失效
+- **封堵**：名单里加 `toybox`。匹配所有 toybox applet 是安全的，因为探针只在查询 **su 路径本身** 时触发；`busybox` 仍不列入，因为它常充当 shell（`busybox sh`），隐藏会破坏弹窗
+
 
 ### C. 影响 `which sh` 等非 su 路径
 - **路径**：匹配逻辑没先比对路径就动返回

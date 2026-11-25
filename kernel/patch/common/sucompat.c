@@ -739,13 +739,20 @@ __maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args,
 
 /*
  * Programs whose job is to *report* whether a file exists: which, type, command -v,
- * whereis. Those are the only callers that must be told "no such file".
+ * whereis, and toybox.
+ *
+ * "toybox" is in the list for a concrete reason: on the target ROM `which` is a
+ * toybox applet, and the linker reports the binary it actually maps as
+ * /system/bin/toybox. Depending on how the entry point was reached, comm is either
+ * "which" (basename of the exec'd path) or "toybox", so both must match or the probe
+ * silently misses the very detector it exists for. Matching all toybox applets is
+ * harmless: the probe only ever fires for a lookup of the su path itself.
  *
  * Deliberately NOT listed:
  *   - "sh"/"ash"/"mksh": the shell resolves the same path when the user runs su, and
  *     hiding it there would make su unreachable, so the prompt could never fire.
- *   - "busybox": it multiplexes hundreds of applets; hiding su from all of them
- *     breaks `busybox ls`-style usage without helping the probe.
+ *   - "busybox": unlike toybox it commonly *provides the shell* (`busybox sh`), so
+ *     matching it would hide su from that shell and break the prompt.
  *
  * comm is TASK_COMM_LEN (16) bytes, NUL-terminated, and may hold a truncated name.
  * Only the prefix is compared, over exactly strlen(name) bytes, so a shorter comm
@@ -754,7 +761,7 @@ __maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args,
 static int su_comm_is_path_probe(const char *comm)
 {
     static const char *const names[] = {
-        "which", "type", "command", "whereis", NULL,
+        "which", "type", "command", "whereis", "toybox", NULL,
     };
 
     if (!comm) return 0;
