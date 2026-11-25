@@ -11,6 +11,9 @@ grep -n "su_register_path_probe_hooks" kernel/patch/common/sucompat.c   # 应无
 
 # 探针判定与模型一致
 cd test && gcc -O1 -std=gnu11 -o /tmp/m su_probe_model.c && /tmp/m      # MODEL OK
+
+# 裁决状态机（白名单/黑名单/超时不固化）
+cd test && gcc -O1 -std=gnu11 -o /tmp/s su_prompt_state_model.c && /tmp/s   # STATE MODEL OK
 ```
 
 ## 1. 真机验证（唯一的人工闸门）
