@@ -16,6 +16,25 @@ cd test && gcc -O1 -std=gnu11 -o /tmp/m su_probe_model.c && /tmp/m      # MODEL 
 cd test && gcc -O1 -std=gnu11 -o /tmp/s su_prompt_state_model.c && /tmp/s   # STATE MODEL OK
 ```
 
+## 0b. ABI 不变量（跨层核对，2026-11-26 已核对一致）
+
+任何一项不一致都会让链路静默失效，改动后必须重跑：
+
+| 不变量 | 位置 | 值 |
+|---|---|---|
+| decision 码 | kernel `uapi/scdefs.h` / `tools/uapi` / manager `cpp/uapi` / `apd/supercall.rs` / `Natives.kt` | 0/1/2/-1/-2/-3，五处一致 |
+| pending 组 | kernel `su_prompt_kstorage_gid`（断言 ==2） | 2，`apd KSTORAGE_SU_PROMPT_GROUP=2` |
+| denylist 组 | kernel `su_deny_kstorage_gid`（断言 ==3） | 3，manager `KSTORAGE_UNUSED_GROUP_3` |
+| `struct su_request` | kernel 与 manager `cpp/uapi` 字段序/类型 | 完全一致（132 字节，arm32） |
+| `SU_REQ_COMM_LEN` | kernel / tools / manager | 16，`apd comm:[u8;16]` |
+| `SUPERCALL_SU_PENDING_POLL` / `_DECISION` | kernel / tools / manager / apd | 0x1113 / 0x1114 |
+
+安全不变量（`supercall.c`）：
+
+- `L370 if (!is_authed) return -EPERM;` 位于 PENDING_POLL / DECISION 两个 case **之前** —— 只有受信管理器能裁决；
+- `L339 if (!is_authed && su_prompt_is_group(arg1))` —— 未认证调用者**不能写 pending 组**，所以白名单里的 App 无法伪造自己的 ALLOW 记录。
+
+
 ## 1. 真机验证（唯一的人工闸门）
 
 ```bash
