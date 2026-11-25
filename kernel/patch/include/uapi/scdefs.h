@@ -152,13 +152,27 @@ struct su_profile
 #define SUPERCALL_SU_PENDING_POLL 0x1113
 #define SUPERCALL_SU_DECISION     0x1114
 
-/* Decision values written back by the manager (and read back by the kernel). */
-#define SU_DECISION_PENDING  0
-#define SU_DECISION_ALLOW    1
-#define SU_DECISION_DENY    (-1)
-#define SU_DECISION_TIMEOUT (-2)
+/* Decision values written back by the manager (and read back by the kernel).
+ *
+ * ALLOW / DENY         : decide this call AND remember it (whitelist / denylist)
+ * ALLOW_ONCE/DENY_ONCE : decide this call only, remember nothing
+ * TIMEOUT              : nobody answered; the kernel applies its configured
+ *                        timeout policy and remembers nothing */
+#define SU_DECISION_PENDING     0
+#define SU_DECISION_ALLOW       1
+#define SU_DECISION_ALLOW_ONCE  2
+#define SU_DECISION_DENY      (-1)
+#define SU_DECISION_TIMEOUT   (-2)
+#define SU_DECISION_DENY_ONCE (-3)
 
 #define SU_REQ_COMM_LEN 16
+
+/* How long the kernel holds an execve() waiting for the manager's answer, and
+ * how often it re-reads the pending record. Bounded on purpose: if the manager
+ * is not running the call fails according to the configured timeout policy
+ * (control_feature("su_prompt_timeout"): 0 = deny, 1 = allow). */
+#define SU_PROMPT_TIMEOUT_MS 10000
+#define SU_PROMPT_POLL_MS       50
 
 /*
  * One pending su request. Stored in kstorage group KSTORAGE_UNUSED_GROUP_2,

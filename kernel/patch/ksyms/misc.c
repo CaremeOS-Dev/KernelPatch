@@ -335,6 +335,12 @@ static void _linux_mm_utils_sym_match(const char *name, unsigned long addr)
     kfunc_match(kfree, name, addr);
 }
 
+// kernel/sched/core.c
+// Used by the synchronous su prompt: the execve() hook parks the caller until the
+// manager answers. msleep() is EXPORT_SYMBOL'd, so kallsyms finds it; if it does
+// not, su_prompt_can_wait() reports 0 and the asynchronous path is used instead.
+void kfunc_def(msleep)(unsigned int msecs) = 0;
+
 // mm/vmalloc.c
 #include <linux/vmalloc.h>
 
@@ -390,6 +396,7 @@ static void _linux_mm_vmalloc_sym_match(const char *name, unsigned long addr)
     // kfunc_match(vm_map_ram, name, addr);
     // kfunc_match(vm_unmap_aliases, name, addr);
 
+    kfunc_match(msleep, name, addr);
     kfunc_match(vmalloc, name, addr);
     kfunc_match(vmalloc_noprof, name, addr);
     kfunc_match(vzalloc, name, addr);

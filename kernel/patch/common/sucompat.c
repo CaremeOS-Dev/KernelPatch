@@ -44,6 +44,13 @@
 
 const char sh_path[] = SH_PATH;
 const char default_su_path[] = SU_PATH;
+/* Where a refused su is pointed at, so execve fails with ENOENT instead of the
+ * getname_flags rewrite turning it into /system/bin/sh. Must never exist. */
+static const char denied_su_path[] = "/system/bin/.su-refused-by-kpatch";
+
+/* udata bits for the fstatat/faccessat probes: bit0 = the syscall dispatcher
+ * already gated by uid, bit1 = this registration is the access-class probe whose
+ * path must stay hidden from un-granted uids. */
 
 #ifdef ANDROID
 const char legacy_su_path[] = LEGACY_SU_PATH;
@@ -56,17 +63,33 @@ static const char *current_su_path = 0;
 static int su_kstorage_gid = -1;
 static int exclude_kstorage_gid = -1;
 static int su_prompt_kstorage_gid = -1;
+/* uids the user explicitly refused: their next su fails immediately (no prompt),
+ * exactly like a non-whitelisted caller on stock KernelPatch. */
+static int su_deny_kstorage_gid = -1;
+/* uids that must not see su at all (root detectors that probe `which su`).
+ * kstorage group 4; managed by the manager through KSTORAGE_WRITE/REMOVE, so no
+ * extra supercall is needed. */
 static volatile int su_prompt_on = 0;   /* off by default; toggled via control_feature("su_prompt") */
-/* KernelPatch is freestanding: no sleep/wait primitives. The kernel only
- * records a pending request in kstorage (group 2, key=pid) and still elevates
- * + execs apd as usual. The blocking "wait for user tap" runs in apd (userspace).
- */
+/* What to do when the manager does not answer within SU_PROMPT_TIMEOUT_MS:
+ * 0 = deny (default), 1 = allow. Toggled via control_feature("su_prompt_timeout"). */
+static volatile int su_prompt_timeout_allow = 0;
+
+/* Diagnostics for the which-probe. Both are read-only counters exposed through
+ * controlFeature("su_probe_status") so the manager can show whether the probe is
+ * actually doing anything instead of guessing from `which su` output. */
+static int su_probe_missing_putname = 0;   /* 1 = probe skipped (kfunc unresolved) */
+static unsigned long su_probe_hides = 0;   /* how many lookups were answered ENOENT */
+
+/* kfunc_def(msleep) declares the resolved-symbol pointer kf_msleep in
+ * patch/ksyms/misc.c. This tree ships no linux/delay.h, so declare it here.
+ * When the kernel did not export it (kallsyms miss) the pointer stays NULL and
+ * we fall back to the asynchronous path below instead of calling through NULL. */
+extern void kfunc_def(msleep)(unsigned int msecs);
 /* 1 while su_register_path_probe_hooks() has the fstatat/faccessat probes
  * installed.  Stays 0 under the AArch32 safety gate so the unregister path
  * never unwraps a hook that was never installed. */
-static int su_path_probe_hooks_active = 0;
-static void su_register_path_probe_hooks(void);
-static void su_unregister_path_probe_hooks(void);
+/* Off by default; controlFeature("path_probe") turns the stat/access split on.
+ * Kept runtime-only so a bad interaction cannot survive a reboot. */
 static int su_hook_getname_flags(void);
 static int su_syscall_gate(void);
 long kp_control_feature_sc(const char __user *uname, int state)
@@ -88,16 +111,43 @@ long kp_control_feature_sc(const char __user *uname, int state)
         return __atomic_load_n(&su_prompt_on, __ATOMIC_RELAXED);
     }
 
+    if (!strcmp(name, "su_prompt_timeout")) {
+        if (state >= 0) {
+            __atomic_store_n(&su_prompt_timeout_allow, state ? 1 : 0, __ATOMIC_RELAXED);
+            logkfi("su_prompt timeout -> %s\n", state ? "allow" : "deny");
+        }
+        return __atomic_load_n(&su_prompt_timeout_allow, __ATOMIC_RELAXED);
+    }
+
+    /*
+     * Read-only diagnostics for the which-probe, so "探针好像没生效" can be
+     * answered from the device instead of guessed at:
+     *   bit0 = probe is skipped because putname never resolved
+     *   high = number of lookups answered ENOENT (saturating at 2^24)
+     * Writing is refused: this is a report, not a switch.
+     */
+    if (!strcmp(name, "su_probe_status")) {
+        if (state >= 0) return -EPERM;
+        unsigned long hides = __atomic_load_n(&su_probe_hides, __ATOMIC_RELAXED);
+        if (hides > 0xFFFFFEUL) hides = 0xFFFFFEUL;
+        return (long)((hides << 8) | (su_probe_missing_putname ? 1 : 0));
+    }
+
+    /*
+     * sucompat_extra / path_probe used to install the fstatat/faccessat probes.
+     * That mechanism is retired: on this kernel the syscall probes corrupted
+     * callers system-wide (linker Bad address / Invalid argument, adbd fork()
+     * EFAULT), and the `which`-hiding they were meant to provide now happens in
+     * the getname_flags after-hook, which never writes user memory.
+     *
+     * The names stay accepted so an older manager asking about them gets a
+     * definite answer instead of -ENOENT, but they are inert: nothing can install
+     * the dangerous hooks again, not even by accident. Reporting 0 (rather than
+     * the requested state) is deliberate -- a caller must not believe the probes
+     * are active.
+     */
     if (!strcmp(name, "sucompat_extra") || !strcmp(name, "path_probe")) {
-        if (state < 0)
-            /* Query: check if the hooks are currently registered. */
-            return 0;   /* not tracked */
-        if (state)
-            su_register_path_probe_hooks();
-        else
-            su_unregister_path_probe_hooks();
-        logkfi("sucompat_extra %s via supercall\n",
-               state ? "enabled" : "disabled");
+        logkfi("feature %s is retired (no-op), state ignored: %d\n", name, state);
         return 0;
     }
 
@@ -161,6 +211,104 @@ KP_EXPORT_SYMBOL(is_su_allow_uid);
 int su_prompt_enabled(void)
 {
     return __atomic_load_n(&su_prompt_on, __ATOMIC_RELAXED);
+}
+
+/* True when the payload can hold an execve() in the kernel. Sleeping inside the
+ * execve hook is legal (process context, no locks held), but only if msleep
+ * actually resolved -- otherwise the asynchronous path is used. */
+int su_prompt_can_wait(void)
+{
+    return kf_msleep != 0;
+}
+
+/* Bounded wait for the manager's answer. *timed_out says whether the answer came
+ * from the user or from the clock: a user decision is remembered, a timeout is
+ * not, so the next su asks again. */
+static int su_prompt_wait(pid_t pid, int *timed_out)
+{
+    struct su_request req;
+    *timed_out = 0;
+    for (int waited = 0; waited < SU_PROMPT_TIMEOUT_MS; waited += SU_PROMPT_POLL_MS) {
+        if (!kf_msleep) break;
+        kf_msleep(SU_PROMPT_POLL_MS);
+        if (read_kstorage(su_prompt_kstorage_gid, (long)pid, &req, 0, sizeof(req), false) < 0)
+            return SU_DECISION_DENY_ONCE;     /* record vanished -> deny, remember nothing */
+        if (req.decision == SU_DECISION_ALLOW || req.decision == SU_DECISION_ALLOW_ONCE ||
+            req.decision == SU_DECISION_DENY || req.decision == SU_DECISION_DENY_ONCE ||
+            req.decision == SU_DECISION_TIMEOUT)
+            return req.decision;
+    }
+    /* Nobody answered: the configured policy decides, and nothing is persisted. */
+    *timed_out = 1;
+    return __atomic_load_n(&su_prompt_timeout_allow, __ATOMIC_RELAXED)
+               ? SU_DECISION_ALLOW_ONCE
+               : SU_DECISION_DENY_ONCE;
+}
+
+/* ---- SU prompt: remembered decisions ------------------------------------- */
+
+int is_su_deny_uid(uid_t uid)
+{
+    if (su_deny_kstorage_gid < 0) return 0;
+    int denied = 0;
+    rcu_read_lock();
+    const struct kstorage *ks = get_kstorage(su_deny_kstorage_gid, uid);
+    denied = !IS_ERR_OR_NULL(ks) && ks->dlen > 0;
+    rcu_read_unlock();
+    return denied;
+}
+
+static void su_deny_add(uid_t uid)
+{
+    u32 on = 1;
+    if (su_deny_kstorage_gid < 0) return;
+    write_kstorage(su_deny_kstorage_gid, (long)uid, &on, 0, sizeof(on), false);
+    logkfi("su_deny add uid: %d\n", uid);
+}
+
+static void su_deny_remove(uid_t uid)
+{
+    if (su_deny_kstorage_gid < 0) return;
+    if (remove_kstorage(su_deny_kstorage_gid, (long)uid) >= 0)
+        logkfi("su_deny remove uid: %d\n", uid);
+}
+
+/* Apply a decision. A user answer is remembered in the whitelist/denylist; a
+ * timeout is not. The pending record is always dropped, so group 2 does not
+ * accumulate one entry per su forever. */
+static void su_prompt_apply(uid_t uid, pid_t pid, int decision, int timed_out)
+{
+    int allow = (decision == SU_DECISION_ALLOW || decision == SU_DECISION_ALLOW_ONCE);
+    /* Only ALLOW / DENY (not the *_ONCE variants) are remembered, and a timeout
+     * is never remembered. */
+    int remember = !timed_out && (decision == SU_DECISION_ALLOW || decision == SU_DECISION_DENY);
+
+    if (remember) {
+        if (allow) {
+            su_deny_remove(uid);
+            su_add_allow_uid(uid, 0, all_allow_sctx);
+            logkfi("su_prompt remember ALLOW uid: %d\n", uid);
+        } else {
+            su_remove_allow_uid(uid);
+            su_deny_add(uid);
+            logkfi("su_prompt remember DENY uid: %d\n", uid);
+        }
+    } else {
+        logkfi("su_prompt %s uid: %d -> %s (not remembered)\n",
+               timed_out ? "timeout" : "one-shot", uid, allow ? "allow" : "deny");
+    }
+    remove_kstorage(su_prompt_kstorage_gid, (long)pid);
+}
+
+/* True for a uid that can reach the prompt: feature on, not whitelisted, not
+ * refused before. Such a caller must also *see* /system/bin/su -- on this port the
+ * path is virtual (getname_flags redirects it to /system/bin/sh), so hiding it
+ * would make the shell's PATH lookup fail before execve() and the prompt could
+ * never fire. */
+static int su_prompt_reachable(uid_t uid)
+{
+    return su_prompt_enabled() && !is_su_allow_uid(uid) && !is_trusted_manager_uid(uid) &&
+           !is_su_deny_uid(uid);
 }
 
 /* True when `gid` is the kstorage group that holds pending su requests. Used by
@@ -357,6 +505,9 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
     uid_t uid = current_uid();
     int trusted = is_trusted_manager_uid(uid);
     int allowed = is_su_allow_uid(uid);
+
+    /* Explicitly refused before: fail like a missing binary, do not ask again. */
+    if (!trusted && !allowed && is_su_deny_uid(uid)) return;
     /* Only a non-whitelisted caller can enter prompt mode, and only when the
      * trusted manager explicitly enabled the feature via control_feature. */
     int prompt_mode = !trusted && !allowed && su_prompt_enabled();
@@ -402,9 +553,42 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
         long wrc = write_kstorage(su_prompt_kstorage_gid, (long)pid, &req, 0, sizeof(req), false);
         if (wrc < 0) return;
 
-        logkfi("su_prompt pending uid: %d, pid: %d (apd will arbitrate)\n", uid, pid);
-        /* Do NOT sleep: elevate + exec apd as usual, and let apd block in
-         * userspace until the manager writes ALLOW/DENY into this kstorage. */
+        logkfi("su_prompt pending uid: %d, pid: %d\n", uid, pid);
+
+        /* Synchronous arbitration: hold the syscall in the kernel (bounded by
+         * SU_PROMPT_TIMEOUT_MS) and let the manager's answer decide it.
+         *
+         * Three outcomes all end up in the same place:
+         *   allow           -> fall through and redirect to apd (root shell)
+         *   deny            -> DENY / DENY_ONCE
+         *   timeout + deny  -> DENY_ONCE (see su_prompt_wait)
+         * and every non-allow outcome must *point the exec somewhere that cannot
+         * exist*. Leaving the path untouched is not enough here: su is visible to
+         * a prompt-eligible uid, so after_getname_flags would rewrite
+         * /system/bin/su to /system/bin/sh and hand the caller a plain shell --
+         * a refusal that looks like a success is worse than an error.
+         * If msleep did not resolve (kallsyms miss) fall through to the
+         * asynchronous apd-side wait. */
+        if (su_prompt_can_wait()) {
+            int timed_out = 0;
+            int decision = su_prompt_wait(pid, &timed_out);
+            su_prompt_apply(uid, pid, decision, timed_out);
+            if (decision != SU_DECISION_ALLOW && decision != SU_DECISION_ALLOW_ONCE) {
+                /* Deny by pointing the exec at a path that cannot exist. Simply
+                 * dropping the redirect is not enough once su is visible to this
+                 * uid: after_getname_flags would rewrite /system/bin/su to
+                 * /system/bin/sh and hand the caller a plain shell. */
+                char __user *uptr = copy_to_user_stack(denied_su_path, sizeof(denied_su_path));
+                if (uptr && !IS_ERR(uptr)) *u_filename_p = uptr;
+                logkfi("su_prompt denied uid: %d pid: %d -> ENOENT\n", uid, pid);
+                return;
+            }
+            logkfi("su_prompt allowed uid: %d pid: %d\n", uid, pid);
+        } else {
+            logkfi("su_prompt async (msleep unresolved), apd will arbitrate\n");
+        }
+
+        /* Allowed (or asynchronous fallback): elevate + exec apd as usual. */
         strncpy(profile.scontext, all_allow_sctx, sizeof(profile.scontext) - 1);
         profile.scontext[sizeof(profile.scontext) - 1] = '\0';
         goto commit_and_redirect;
@@ -525,26 +709,46 @@ __maybe_unused static void before_execveat(hook_fargs5_t *args, void *udata)
  * what lets su_handler_arg1_ufilename_before and friends drop their own root
  * checks: for everyone else the dispatcher runs no callback, on any syscall, so
  * there is no per-syscall signature and no cross-syscall inconsistency. */
+/* True for a uid that can reach the prompt: feature on, not whitelisted, not
+ * refused before. Such a caller must also *see* /system/bin/su -- on this port the
+ * path is virtual (getname_flags redirects it to /system/bin/sh), so hiding it
+ * would make the shell's PATH lookup fail before execve() and the prompt could
+ * never fire. */
+static int su_prompt_reachable(uid_t uid);
+
 static int su_syscall_gate(void)
 {
     uid_t uid = current_uid();
-    return uid == 0 || is_su_allow_uid(uid) || is_trusted_manager_uid(uid);
+    return uid == 0 || is_su_allow_uid(uid) || is_trusted_manager_uid(uid) ||
+           su_prompt_reachable(uid);
 }
 
 __maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args, void *udata)
 {
+    /*
+     * faccessat probe: hide /system/bin/su from access(2), which is what `which su`
+     * and root detectors use, while stat() keeps finding it for the shell (the
+     * getname_flags rewrite handles stat).
+     *
+     * This is read-only on purpose. The earlier version copied a replacement path
+     * into the caller's stack and pointed the argument at it on *every*
+     * fstatat/faccessat in the system; on this kernel that corrupted long-lived
+     * processes (linker: `reading "/system/etc/ld.config.txt": Bad address`, and
+     * adbd's fork() reporting EFAULT). Nothing here writes user memory: the path is
+     * read into a kernel buffer, and a hit is answered by skipping the syscall and
+     * returning -ENOENT through the hook frame.
+     */
+    (void)udata;
+
     uid_t uid = current_uid();
+    /* Granted uids must see su; denied uids are already past caring. */
+    if (!su_prompt_reachable(uid)) return;
 
-    /* In global-dispatcher mode the dispatcher already gated this callback on the
-     * caller's uid (su_syscall_gate), so the check would be redundant; the legacy
-     * per-syscall fallback has no gate, so it must stay there. udata == 1 marks a
-     * gated registration. */
-    if (!udata && uid != 0 && !is_su_allow_uid(uid) && !is_trusted_manager_uid(uid)) return;
-
-    char __user **u_filename_p = (char __user **)syscall_argn_p(args, 1);
+    char __user *ufilename = (char __user *)args->arg1;
+    if (!ufilename) return;
 
     char filename[SU_PATH_MAX_LEN];
-    int flen = compat_strncpy_from_user(filename, *u_filename_p, sizeof(filename));
+    int flen = compat_strncpy_from_user(filename, ufilename, sizeof(filename));
     if (flen <= 0) return;
 
 #ifdef ANDROID
@@ -552,14 +756,45 @@ __maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args,
 #else
     if (strcmp(filename, current_su_path)) return;
 #endif
-    {
-        void *uptr = copy_to_user_stack(sh_path, sizeof(sh_path));
-        if (uptr && !IS_ERR(uptr)) {
-            *u_filename_p = uptr;
-        } else {
-            logkfi("su uid: %d, cp stack error: %d\n", uid, uptr);
-        }
+
+    args->skip_origin = 1;
+    args->ret = (uint64_t)(long)(-ENOENT);
+    logkfi("su access probe: uid %d -> ENOENT\n", uid);
+}
+
+/*
+ * Programs whose job is to *report* whether a file exists: which, type, command -v,
+ * whereis, and toybox.
+ *
+ * "toybox" is in the list for a concrete reason: on the target ROM `which` is a
+ * toybox applet, and the linker reports the binary it actually maps as
+ * /system/bin/toybox. Depending on how the entry point was reached, comm is either
+ * "which" (basename of the exec'd path) or "toybox", so both must match or the probe
+ * silently misses the very detector it exists for. Matching all toybox applets is
+ * harmless: the probe only ever fires for a lookup of the su path itself.
+ *
+ * Deliberately NOT listed:
+ *   - "sh"/"ash"/"mksh": the shell resolves the same path when the user runs su, and
+ *     hiding it there would make su unreachable, so the prompt could never fire.
+ *   - "busybox": unlike toybox it commonly *provides the shell* (`busybox sh`), so
+ *     matching it would hide su from that shell and break the prompt.
+ *
+ * comm is TASK_COMM_LEN (16) bytes, NUL-terminated, and may hold a truncated name.
+ * Only the prefix is compared, over exactly strlen(name) bytes, so a shorter comm
+ * ("typ") does not match and no read goes past the string's end.
+ */
+static int su_comm_is_path_probe(const char *comm)
+{
+    static const char *const names[] = {
+        "which", "type", "command", "whereis", "toybox", NULL,
+    };
+
+    if (!comm) return 0;
+
+    for (int i = 0; names[i]; i++) {
+        if (!strncmp(comm, names[i], strlen(names[i]))) return 1;
     }
+    return 0;
 }
 
 static void after_getname_flags(hook_fargs3_t *args, void *udata)
@@ -568,10 +803,56 @@ static void after_getname_flags(hook_fargs3_t *args, void *udata)
     if (IS_ERR_OR_NULL(fn)) return;
 
     uid_t uid = current_uid();
-    if (!is_su_allow_uid(uid) && !is_trusted_manager_uid(uid)) return;
-
     const char *name = fn->name;
     if (!name || strcmp(name, su_get_path())) return;
+
+    int trusted = (uid == 0) || is_su_allow_uid(uid) || is_trusted_manager_uid(uid);
+
+    /*
+     * The probe, exactly as specified: a which-class process asking for su, from an
+     * uid that is not trusted, is told the file does not exist.
+     *
+     * Nothing is written to user memory and no syscall is hooked. getname_flags has
+     * already allocated the filename, so this after-hook replaces the result with
+     * -ENOENT and releases that allocation with putname(). An earlier attempt hooked
+     * fstatat/faccessat and rewrote the caller's argument instead, which corrupted
+     * long-lived processes system-wide on this kernel (linker: Bad address /
+     * Invalid argument, adbd fork(): EFAULT); that route is gone for good.
+     *
+     * putname() is mandatory before returning the error: skipping it would leak one
+     * struct filename per probe, and a detector polling `which su` would drip kernel
+     * memory until it OOMs. When putname is unavailable the probe is skipped rather
+     * than leaking -- a visible su beats an unbounded leak.
+     * The probe also only applies while su prompting is on, so a device that never
+     * enabled the feature cannot answer differently from stock.
+     */
+    if (!trusted && su_prompt_enabled()) {
+        const char *comm = get_task_comm(current);
+        if (su_comm_is_path_probe(comm)) {
+            if (kfunc(putname)) {
+                kfunc(putname)(fn);
+                args->ret = (uint64_t)(long)(-ENOENT);
+                su_probe_hides++;
+                logkfi("su probe: %s (uid %d) -> ENOENT\n", comm, uid);
+                return;
+            }
+            /* putname is the only kfunc the probe needs. Without it the probe is
+             * skipped rather than leaking one struct filename per call -- but that
+             * skip used to be silent, which looks exactly like "the probe does not
+             * work". Say it once, loudly. */
+            if (!su_probe_missing_putname) {
+                su_probe_missing_putname = 1;
+                logkfi("su probe DISABLED: putname unresolved (would leak)\n");
+                log_boot("sucompat: putname unresolved, which-probe disabled\n");
+            }
+        }
+    }
+
+    /* Everything else keeps the old behaviour: granted uids get the sh redirect
+     * (that is what a root shell is), and a uid that can still be prompted must
+     * merely find the path so its shell reaches execve(), where the exec hook
+     * decides -- on deny it points the exec at denied_su_path. */
+    if (!trusted && !su_prompt_reachable(uid)) return;
 
     if (strlen(sh_path) <= strlen(name)) {
         strcpy((char *)name, sh_path);
@@ -674,6 +955,10 @@ int su_compat_init()
     su_prompt_kstorage_gid = try_alloc_kstroage_group();
     if (su_prompt_kstorage_gid != KSTORAGE_UNUSED_GROUP_2) return -ENOMEM;
 
+    /* Remembers uids the user refused, so their next su is a plain ENOENT. */
+    su_deny_kstorage_gid = try_alloc_kstroage_group();
+    if (su_deny_kstorage_gid != KSTORAGE_UNUSED_GROUP_3) return -ENOMEM;
+
 #ifdef ANDROID
     // default shell
     if (!all_allow_sctx[0]) {
@@ -734,7 +1019,9 @@ int su_compat_init()
     rc = su_hook_getname_flags();
     log_boot("hook getname_flags rc: %d\n", rc);
 
-    su_register_path_probe_hooks();
+    /* The fstatat/faccessat probes are retired (see kp_control_feature_sc): the
+     * `which`-hiding they provided now lives in after_getname_flags, which cannot
+     * corrupt a caller. Nothing is registered here any more. */
 
     return 0;
 }
@@ -767,103 +1054,10 @@ static int su_hook_getname_flags(void)
     return rc;
 }
 
-static void su_register_path_probe_hooks(void)
-{
-    #ifdef ANDROID
-        if (unlikely(android_is_safe_mode)) return;
-    #endif
-
-    /*
-     * DISABLED BY DEFAULT on AArch32 (XTC Z9 / MSM8937, kernel 4.9.193).
-     *
-     * These four hooks are the exact delta between the v3 build, which booted
-     * and stayed healthy, and the v7 build, which survives 11.5 s and then
-     * takes a system-wide EFAULT/EINVAL storm:
-     *
-     *   - v3 never reached this function at all.  sucompat_init() is called
-     *     from report_user_event("post-fs-data","before"), which only runs once
-     *     apd is up; in v3 the superkey never authenticated (userd.c injected
-     *     the literal token "su"), so apd never started and no probe was ever
-     *     installed.  With the "%s" superkey fixed, apd runs - and the probes
-     *     run for the first time.
-     *
-     *   - On the device the probes are installed at t=11.558
-     *     (`KP hook __NR3264_fstatat rc: 0` / `__NR_faccessat rc: 0`), and the
-     *     first `Bad address` appears 14.7 ms later at t=11.573
-     *     (ueventd reading sysfs).  From that point nothing recovers: 60
-     *     EFAULT lines, no successful open/stat/exec anywhere afterwards,
-     *     while fork() keeps working.
-     *
-     *   - Everything else in the same window is already proven harmless: the
-     *     inline getname_flags hook, the execve/execveat hooks and the openat
-     *     hook have all been live since t=1.04 and the system ran clean for the
-     *     following 10.5 s.
-     *
-     * hook_syscalln()/hook_compat_syscalln() on this kernel both end up
-     * touching sys_call_table[327]/[334] (compat_sys_call_table is NULL, so the
-     * "32-bit" variants fall back to inline_wrap_syscalln() and resolve the
-     * same sys_fstatat64/sys_faccessat bodies - i.e. the same function is
-     * hooked twice), so this is one change, not four independent risks.
-     *
-     * The probes only ever rewrote a path when it was literally
-     * /system/bin/kp or /system/bin/su, so disabling them costs nothing on a
-     * device whose su path is not installed yet.
-     *
-     * To re-enable, delete the `return` below.  kp_control_feature_sc()'s
-     * "path_probe" switch also calls this function, so removing the early
-     * return restores both the boot-time and the runtime enable in one edit.
-     *
-     * Re-enable only after the EFAULT mechanism above is understood; keeping a
-     * booting device is worth more than an su-probe nicety.
-     */
-    log_boot("sucompat: path probe hooks DISABLED (AArch32 safety, see sucompat.c)\n");
-    return;
-
-    hook_err_t rc;
-
-    /* udata == 1 tells the callback the dispatcher gate already handled the uid
-     * check; without the global dispatcher it must do the check itself. */
-    void *gated = syscall_hook_global_enabled() ? (void *)1 : (void *)0;
-
-    rc = hook_syscalln(__NR3264_fstatat, 4, su_handler_arg1_ufilename_before, 0, gated);
-    log_boot("hook __NR3264_fstatat rc: %d\n", rc);
-
-    rc = hook_syscalln(__NR_faccessat, 3, su_handler_arg1_ufilename_before, 0, gated);
-    log_boot("hook __NR_faccessat rc: %d\n", rc);
-
-    /* 32-bit compat probes: fstatat64(327) / faccessat(334) */
-    rc = hook_compat_syscalln(327, 4, su_handler_arg1_ufilename_before, 0, gated);
-    log_boot("hook 32 __NR_fstatat64 rc: %d\n", rc);
-
-    rc = hook_compat_syscalln(334, 3, su_handler_arg1_ufilename_before, 0, gated);
-    log_boot("hook 32 __NR_faccessat rc: %d\n", rc);
-
-    su_path_probe_hooks_active = 1;
-}
-
-static void su_unregister_path_probe_hooks(void)
-{
-    /* Nothing was registered by su_register_path_probe_hooks() while the
-     * AArch32 safety gate is active, so do not touch the syscall table here:
-     * hook_unwrap() on a never-hooked function is a needless risk on the
-     * openat/stat fast path. */
-    if (!su_path_probe_hooks_active) return;
-
-    su_path_probe_hooks_active = 0;
-    unhook_syscalln(__NR3264_fstatat, su_handler_arg1_ufilename_before, 0);
-    unhook_syscalln(__NR_faccessat, su_handler_arg1_ufilename_before, 0);
-    unhook_compat_syscalln(327, su_handler_arg1_ufilename_before, 0);
-    unhook_compat_syscalln(334, su_handler_arg1_ufilename_before, 0);
-}
-
 void sucompat_init()
 {
-    return;
-    struct file *file = filp_open(sucompat_file, O_RDONLY, 0);
-    if (IS_ERR(file)) {
-        log_boot("failed to open sucompat file: %ld\n", PTR_ERR(file));
-        return;
-    }
-    filp_close(file, NULL);
-    su_register_path_probe_hooks(); 
+    /* Retired: the fstatat/faccessat probes are gone for good (they corrupted
+     * callers on this kernel). sucompat no longer needs a marker file, because the
+     * only thing it would have enabled is that retired probe. The getname_flags
+     * wrap is installed unconditionally from android_user_init(). */
 }
