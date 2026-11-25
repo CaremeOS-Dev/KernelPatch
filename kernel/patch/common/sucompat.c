@@ -741,21 +741,61 @@ __maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args,
     logkfi("su access probe: uid %d -> ENOENT\n", uid);
 }
 
+/*
+ * Is `comm` a program whose job is to *report* whether a file exists -- `which`,
+ * `type`, `command -v`, a root detector? Those are the only callers that must be
+ * told "no such file". A shell resolving the same path on behalf of `su` is not in
+ * this list, so the prompt keeps working.
+ */
+static int su_comm_is_path_probe(const char *comm)
+{
+    static const char *const names[] = {
+        "which", "type", "command", "whereis", "busybox",
+        NULL,
+    };
+    for (int i = 0; names[i]; i++) {
+        if (!strncmp(comm, names[i], strlen(names[i]))) return 1;
+    }
+    return 0;
+}
+
 static void after_getname_flags(hook_fargs3_t *args, void *udata)
 {
     struct filename *fn = (struct filename *)args->ret;
     if (IS_ERR_OR_NULL(fn)) return;
 
     uid_t uid = current_uid();
-    /* Granted uids get a root shell; prompt-eligible uids must merely *find* the
-     * path so their shell's PATH search succeeds and execve() is reached -- the
-     * exec hook decides what actually happens, and on deny it points the exec at
-     * denied_su_path so this rewrite cannot hand out a shell. */
-    if (!is_su_allow_uid(uid) && !is_trusted_manager_uid(uid) && !su_prompt_reachable(uid))
-        return;
-
     const char *name = fn->name;
     if (!name || strcmp(name, su_get_path())) return;
+
+    int trusted = (uid == 0) || is_su_allow_uid(uid) || is_trusted_manager_uid(uid);
+
+    /*
+     * The probe, exactly as specified: a which-class process asking for su, from an
+     * uid that is not trusted, is told the file does not exist.
+     *
+     * Nothing is written to user memory here and no syscall is hooked. The path was
+     * already resolved by getname_flags; an after-hook can replace the result with
+     * -ENOENT and putname() the filename it allocated. An earlier attempt hooked
+     * fstatat/faccessat and rewrote the caller's argument instead, which corrupted
+     * long-lived processes system-wide on this kernel (linker: Bad address /
+     * Invalid argument, adbd fork(): EFAULT); that route is gone for good.
+     */
+    if (!trusted) {
+        const char *comm = get_task_comm(current);
+        if (comm && su_comm_is_path_probe(comm)) {
+            if (kfunc(putname)) kfunc(putname)(fn);
+            args->ret = (uint64_t)(long)(-ENOENT);
+            logkfi("su probe: %s (uid %d) -> ENOENT\n", comm, uid);
+            return;
+        }
+    }
+
+    /* Everything else keeps the old behaviour: granted uids get the sh redirect
+     * (that is what a root shell is), and a uid that can still be prompted must
+     * merely find the path so its shell reaches execve(), where the exec hook
+     * decides -- on deny it points the exec at denied_su_path. */
+    if (!trusted && !su_prompt_reachable(uid)) return;
 
     if (strlen(sh_path) <= strlen(name)) {
         strcpy((char *)name, sh_path);
