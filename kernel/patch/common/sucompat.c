@@ -51,7 +51,6 @@ static const char denied_su_path[] = "/system/bin/.su-refused-by-kpatch";
 /* udata bits for the fstatat/faccessat probes: bit0 = the syscall dispatcher
  * already gated by uid, bit1 = this registration is the access-class probe whose
  * path must stay hidden from un-granted uids. */
-#define SU_PROBE_GATED  ((uintptr_t)1)
 
 #ifdef ANDROID
 const char legacy_su_path[] = LEGACY_SU_PATH;
@@ -83,12 +82,8 @@ extern void kfunc_def(msleep)(unsigned int msecs);
 /* 1 while su_register_path_probe_hooks() has the fstatat/faccessat probes
  * installed.  Stays 0 under the AArch32 safety gate so the unregister path
  * never unwraps a hook that was never installed. */
-static int su_path_probe_hooks_active = 0;
 /* Off by default; controlFeature("path_probe") turns the stat/access split on.
  * Kept runtime-only so a bad interaction cannot survive a reboot. */
-static int su_path_probe_enabled_flag = 0;
-static void su_register_path_probe_hooks(void);
-static void su_unregister_path_probe_hooks(void);
 static int su_hook_getname_flags(void);
 static int su_syscall_gate(void);
 long kp_control_feature_sc(const char __user *uname, int state)
@@ -118,20 +113,21 @@ long kp_control_feature_sc(const char __user *uname, int state)
         return __atomic_load_n(&su_prompt_timeout_allow, __ATOMIC_RELAXED);
     }
 
+    /*
+     * sucompat_extra / path_probe used to install the fstatat/faccessat probes.
+     * That mechanism is retired: on this kernel the syscall probes corrupted
+     * callers system-wide (linker Bad address / Invalid argument, adbd fork()
+     * EFAULT), and the `which`-hiding they were meant to provide now happens in
+     * the getname_flags after-hook, which never writes user memory.
+     *
+     * The names stay accepted so an older manager asking about them gets a
+     * definite answer instead of -ENOENT, but they are inert: nothing can install
+     * the dangerous hooks again, not even by accident. Reporting 0 (rather than
+     * the requested state) is deliberate -- a caller must not believe the probes
+     * are active.
+     */
     if (!strcmp(name, "sucompat_extra") || !strcmp(name, "path_probe")) {
-        if (state < 0)
-            return su_path_probe_hooks_active;
-        if (state) {
-            /* Runtime-only on purpose: if the probes misbehave, a reboot clears
-             * this without the user having to reach a shell first. */
-            __atomic_store_n(&su_path_probe_enabled_flag, 1, __ATOMIC_RELAXED);
-            su_register_path_probe_hooks();
-        } else {
-            su_unregister_path_probe_hooks();
-            __atomic_store_n(&su_path_probe_enabled_flag, 0, __ATOMIC_RELAXED);
-        }
-        logkfi("sucompat_extra %s via supercall\n",
-               state ? "enabled" : "disabled");
+        logkfi("feature %s is retired (no-op), state ignored: %d\n", name, state);
         return 0;
     }
 
@@ -979,7 +975,9 @@ int su_compat_init()
     rc = su_hook_getname_flags();
     log_boot("hook getname_flags rc: %d\n", rc);
 
-    su_register_path_probe_hooks();
+    /* The fstatat/faccessat probes are retired (see kp_control_feature_sc): the
+     * `which`-hiding they provided now lives in after_getname_flags, which cannot
+     * corrupt a caller. Nothing is registered here any more. */
 
     return 0;
 }
@@ -1012,123 +1010,10 @@ static int su_hook_getname_flags(void)
     return rc;
 }
 
-static void su_register_path_probe_hooks(void)
-{
-    #ifdef ANDROID
-        if (unlikely(android_is_safe_mode)) return;
-    #endif
-
-    /*
-     * DISABLED BY DEFAULT on AArch32 (XTC Z9 / MSM8937, kernel 4.9.193).
-     *
-     * These four hooks are the exact delta between the v3 build, which booted
-     * and stayed healthy, and the v7 build, which survives 11.5 s and then
-     * takes a system-wide EFAULT/EINVAL storm:
-     *
-     *   - v3 never reached this function at all.  sucompat_init() is called
-     *     from report_user_event("post-fs-data","before"), which only runs once
-     *     apd is up; in v3 the superkey never authenticated (userd.c injected
-     *     the literal token "su"), so apd never started and no probe was ever
-     *     installed.  With the "%s" superkey fixed, apd runs - and the probes
-     *     run for the first time.
-     *
-     *   - On the device the probes are installed at t=11.558
-     *     (`KP hook __NR3264_fstatat rc: 0` / `__NR_faccessat rc: 0`), and the
-     *     first `Bad address` appears 14.7 ms later at t=11.573
-     *     (ueventd reading sysfs).  From that point nothing recovers: 60
-     *     EFAULT lines, no successful open/stat/exec anywhere afterwards,
-     *     while fork() keeps working.
-     *
-     *   - Everything else in the same window is already proven harmless: the
-     *     inline getname_flags hook, the execve/execveat hooks and the openat
-     *     hook have all been live since t=1.04 and the system ran clean for the
-     *     following 10.5 s.
-     *
-     * hook_syscalln()/hook_compat_syscalln() on this kernel both end up
-     * touching sys_call_table[327]/[334] (compat_sys_call_table is NULL, so the
-     * "32-bit" variants fall back to inline_wrap_syscalln() and resolve the
-     * same sys_fstatat64/sys_faccessat bodies - i.e. the same function is
-     * hooked twice), so this is one change, not four independent risks.
-     *
-     * The probes only ever rewrote a path when it was literally
-     * /system/bin/kp or /system/bin/su, so disabling them costs nothing on a
-     * device whose su path is not installed yet.
-     *
-     * To re-enable, delete the `return` below.  kp_control_feature_sc()'s
-     * "path_probe" switch also calls this function, so removing the early
-     * return restores both the boot-time and the runtime enable in one edit.
-     *
-     * Re-enable only after the EFAULT mechanism above is understood; keeping a
-     * booting device is worth more than an su-probe nicety.
-     *
-     * UPDATE (su prompt, v11312): the mechanism is now understood.
-     * hook_compat_syscalln() needs compat_sys_call_table, which does not exist on
-     * an AArch32 kernel, so it silently fell through to inline_wrap_syscalln() --
-     * an INLINE hook inside sys_fstatat64/sys_faccessat, on the very functions
-     * hook_syscalln() had already wrapped via sys_call_table[]. The same function
-     * carried both a table wrapper and an inline trampoline, and the inline
-     * trampoline resolved its target through the *compat* kallsyms name table,
-     * which on ARM32 does not describe these functions at all. The two probes are
-     * therefore pointless here and are no longer registered; only the native
-     * table hooks remain (fstatat64=327, faccessat=334, per the ARM EABI table).
-     *
-     * The probes still stay OFF by default: they only pay off for the su prompt
-     * (hiding /system/bin/su from access(), which is what `which` and root
-     * detectors use, while stat() keeps it findable for the shell). Turn them on
-     * with controlFeature("path_probe", 1) when that trade-off is wanted.
-     */
-    if (!__atomic_load_n(&su_path_probe_enabled_flag, __ATOMIC_RELAXED)) {
-        log_boot("sucompat: path probe hooks disabled (enable with feature path_probe)\n");
-        return;
-    }
-
-    hook_err_t rc;
-
-    /* Only faccessat is hooked. stat/fstatat must NOT be: the shell's PATH search
-     * goes through stat, and a probe that answers it would break command lookup for
-     * every un-granted uid. The handler is read-only and answers -ENOENT through
-     * the hook frame (skip_origin), so no user memory is ever written.
-     *
-     * No compat registration on ARM: compat_sys_call_table is NULL there, so
-     * hook_compat_syscalln() would fall back to an inline hook inside the same
-     * function the table hook already wraps (that double hook is what produced the
-     * EFAULT storm). On arm64 the compat table is real and the pair is meaningful.
-     */
-    rc = hook_syscalln(__NR_faccessat, 3, su_handler_arg1_ufilename_before, 0,
-                       (void *)(syscall_hook_global_enabled() ? SU_PROBE_GATED : 0));
-    log_boot("hook __NR_faccessat rc: %d\n", rc);
-    if (rc) return;
-
-#ifndef CONFIG_ARM
-    rc = hook_compat_syscalln(334, 3, su_handler_arg1_ufilename_before, 0,
-                              (void *)(syscall_hook_global_enabled() ? SU_PROBE_GATED : 0));
-    log_boot("hook 32 __NR_faccessat rc: %d\n", rc);
-#endif
-
-    su_path_probe_hooks_active = 1;
-}
-
-static void su_unregister_path_probe_hooks(void)
-{
-    if (!su_path_probe_hooks_active) return;
-
-    su_path_probe_hooks_active = 0;
-    /* Must mirror su_register_path_probe_hooks() exactly: unwrapping a hook that
-     * was never installed would patch the wrong site. */
-    unhook_syscalln(__NR_faccessat, su_handler_arg1_ufilename_before, 0);
-#ifndef CONFIG_ARM
-    unhook_compat_syscalln(334, su_handler_arg1_ufilename_before, 0);
-#endif
-}
-
 void sucompat_init()
 {
-    return;
-    struct file *file = filp_open(sucompat_file, O_RDONLY, 0);
-    if (IS_ERR(file)) {
-        log_boot("failed to open sucompat file: %ld\n", PTR_ERR(file));
-        return;
-    }
-    filp_close(file, NULL);
-    su_register_path_probe_hooks(); 
+    /* Retired: the fstatat/faccessat probes are gone for good (they corrupted
+     * callers on this kernel). sucompat no longer needs a marker file, because the
+     * only thing it would have enabled is that retired probe. The getname_flags
+     * wrap is installed unconditionally from android_user_init(). */
 }
