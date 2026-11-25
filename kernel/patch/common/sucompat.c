@@ -538,10 +538,15 @@ static void handle_before_execve(char **__user u_filename_p, char **__user uargv
         /* Synchronous arbitration: hold the syscall in the kernel (bounded by
          * SU_PROMPT_TIMEOUT_MS) and let the manager's answer decide it.
          *
-         * Denying is just "do not redirect": execve then tries the real
-         * /system/bin/su, which does not exist, so the caller gets ENOENT --
-         * byte for byte what a non-whitelisted caller sees on stock
-         * KernelPatch. No hook-frame surgery needed.
+         * Three outcomes all end up in the same place:
+         *   allow           -> fall through and redirect to apd (root shell)
+         *   deny            -> DENY / DENY_ONCE
+         *   timeout + deny  -> DENY_ONCE (see su_prompt_wait)
+         * and every non-allow outcome must *point the exec somewhere that cannot
+         * exist*. Leaving the path untouched is not enough here: su is visible to
+         * a prompt-eligible uid, so after_getname_flags would rewrite
+         * /system/bin/su to /system/bin/sh and hand the caller a plain shell --
+         * a refusal that looks like a success is worse than an error.
          * If msleep did not resolve (kallsyms miss) fall through to the
          * asynchronous apd-side wait. */
         if (su_prompt_can_wait()) {
