@@ -74,6 +74,12 @@ static volatile int su_prompt_on = 0;   /* off by default; toggled via control_f
  * 0 = deny (default), 1 = allow. Toggled via control_feature("su_prompt_timeout"). */
 static volatile int su_prompt_timeout_allow = 0;
 
+/* Diagnostics for the which-probe. Both are read-only counters exposed through
+ * controlFeature("su_probe_status") so the manager can show whether the probe is
+ * actually doing anything instead of guessing from `which su` output. */
+static int su_probe_missing_putname = 0;   /* 1 = probe skipped (kfunc unresolved) */
+static unsigned long su_probe_hides = 0;   /* how many lookups were answered ENOENT */
+
 /* kfunc_def(msleep) declares the resolved-symbol pointer kf_msleep in
  * patch/ksyms/misc.c. This tree ships no linux/delay.h, so declare it here.
  * When the kernel did not export it (kallsyms miss) the pointer stays NULL and
@@ -111,6 +117,20 @@ long kp_control_feature_sc(const char __user *uname, int state)
             logkfi("su_prompt timeout -> %s\n", state ? "allow" : "deny");
         }
         return __atomic_load_n(&su_prompt_timeout_allow, __ATOMIC_RELAXED);
+    }
+
+    /*
+     * Read-only diagnostics for the which-probe, so "探针好像没生效" can be
+     * answered from the device instead of guessed at:
+     *   bit0 = probe is skipped because putname never resolved
+     *   high = number of lookups answered ENOENT (saturating at 2^24)
+     * Writing is refused: this is a report, not a switch.
+     */
+    if (!strcmp(name, "su_probe_status")) {
+        if (state >= 0) return -EPERM;
+        unsigned long hides = __atomic_load_n(&su_probe_hides, __ATOMIC_RELAXED);
+        if (hides > 0xFFFFFEUL) hides = 0xFFFFFEUL;
+        return (long)((hides << 8) | (su_probe_missing_putname ? 1 : 0));
     }
 
     /*
@@ -808,11 +828,23 @@ static void after_getname_flags(hook_fargs3_t *args, void *udata)
      */
     if (!trusted && su_prompt_enabled()) {
         const char *comm = get_task_comm(current);
-        if (su_comm_is_path_probe(comm) && kfunc(putname)) {
-            kfunc(putname)(fn);
-            args->ret = (uint64_t)(long)(-ENOENT);
-            logkfi("su probe: %s (uid %d) -> ENOENT\n", comm, uid);
-            return;
+        if (su_comm_is_path_probe(comm)) {
+            if (kfunc(putname)) {
+                kfunc(putname)(fn);
+                args->ret = (uint64_t)(long)(-ENOENT);
+                su_probe_hides++;
+                logkfi("su probe: %s (uid %d) -> ENOENT\n", comm, uid);
+                return;
+            }
+            /* putname is the only kfunc the probe needs. Without it the probe is
+             * skipped rather than leaking one struct filename per call -- but that
+             * skip used to be silent, which looks exactly like "the probe does not
+             * work". Say it once, loudly. */
+            if (!su_probe_missing_putname) {
+                su_probe_missing_putname = 1;
+                logkfi("su probe DISABLED: putname unresolved (would leak)\n");
+                log_boot("sucompat: putname unresolved, which-probe disabled\n");
+            }
         }
     }
 
