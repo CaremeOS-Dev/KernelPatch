@@ -742,17 +742,27 @@ __maybe_unused static void su_handler_arg1_ufilename_before(hook_fargs6_t *args,
 }
 
 /*
- * Is `comm` a program whose job is to *report* whether a file exists -- `which`,
- * `type`, `command -v`, a root detector? Those are the only callers that must be
- * told "no such file". A shell resolving the same path on behalf of `su` is not in
- * this list, so the prompt keeps working.
+ * Programs whose job is to *report* whether a file exists: which, type, command -v,
+ * whereis. Those are the only callers that must be told "no such file".
+ *
+ * Deliberately NOT listed:
+ *   - "sh"/"ash"/"mksh": the shell resolves the same path when the user runs su, and
+ *     hiding it there would make su unreachable, so the prompt could never fire.
+ *   - "busybox": it multiplexes hundreds of applets; hiding su from all of them
+ *     breaks `busybox ls`-style usage without helping the probe.
+ *
+ * comm is TASK_COMM_LEN (16) bytes, NUL-terminated, and may hold a truncated name.
+ * Only the prefix is compared, over exactly strlen(name) bytes, so a shorter comm
+ * ("typ") does not match and no read goes past the string's end.
  */
 static int su_comm_is_path_probe(const char *comm)
 {
     static const char *const names[] = {
-        "which", "type", "command", "whereis", "busybox",
-        NULL,
+        "which", "type", "command", "whereis", NULL,
     };
+
+    if (!comm) return 0;
+
     for (int i = 0; names[i]; i++) {
         if (!strncmp(comm, names[i], strlen(names[i]))) return 1;
     }
@@ -774,17 +784,24 @@ static void after_getname_flags(hook_fargs3_t *args, void *udata)
      * The probe, exactly as specified: a which-class process asking for su, from an
      * uid that is not trusted, is told the file does not exist.
      *
-     * Nothing is written to user memory here and no syscall is hooked. The path was
-     * already resolved by getname_flags; an after-hook can replace the result with
-     * -ENOENT and putname() the filename it allocated. An earlier attempt hooked
+     * Nothing is written to user memory and no syscall is hooked. getname_flags has
+     * already allocated the filename, so this after-hook replaces the result with
+     * -ENOENT and releases that allocation with putname(). An earlier attempt hooked
      * fstatat/faccessat and rewrote the caller's argument instead, which corrupted
      * long-lived processes system-wide on this kernel (linker: Bad address /
      * Invalid argument, adbd fork(): EFAULT); that route is gone for good.
+     *
+     * putname() is mandatory before returning the error: skipping it would leak one
+     * struct filename per probe, and a detector polling `which su` would drip kernel
+     * memory until it OOMs. When putname is unavailable the probe is skipped rather
+     * than leaking -- a visible su beats an unbounded leak.
+     * The probe also only applies while su prompting is on, so a device that never
+     * enabled the feature cannot answer differently from stock.
      */
-    if (!trusted) {
+    if (!trusted && su_prompt_enabled()) {
         const char *comm = get_task_comm(current);
-        if (comm && su_comm_is_path_probe(comm)) {
-            if (kfunc(putname)) kfunc(putname)(fn);
+        if (su_comm_is_path_probe(comm) && kfunc(putname)) {
+            kfunc(putname)(fn);
             args->ret = (uint64_t)(long)(-ENOENT);
             logkfi("su probe: %s (uid %d) -> ENOENT\n", comm, uid);
             return;
